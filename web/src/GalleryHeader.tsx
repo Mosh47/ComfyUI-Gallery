@@ -3,7 +3,7 @@ import { useGalleryContext } from './GalleryContext';
 import { useDebounce, useCountDown } from 'ahooks';
 import JSZip from 'jszip';
 import FileSaver from 'file-saver';
-import { BASE_PATH, ComfyAppApi } from './ComfyAppApi';
+import { BASE_PATH, ComfyAppApi, BASE_Z_INDEX } from './ComfyAppApi';
 
 // Icons as SVG components for better control
 const IconSearch = () => (
@@ -53,6 +53,7 @@ const GalleryHeader = () => {
     const {
         showSettings, setShowSettings,
         searchFileName, setSearchFileName,
+        searchMode, setSearchMode,
         sortMethod, setSortMethod,
         imagesAutoCompleteNames,
         setAutoCompleteOptions,
@@ -62,6 +63,7 @@ const GalleryHeader = () => {
         refreshFolder,
         currentFolder,
         folderCounts,
+        deleteImages,
     } = useGalleryContext();
 
     const [search, setSearch] = useState("");
@@ -69,8 +71,6 @@ const GalleryHeader = () => {
     const [targetDate, setTargetDate] = useState<number>();
     const [downloading, setDownloading] = useState(false);
     const [deleting, setDeleting] = useState(false);
-    const [showDownloadConfirm, setShowDownloadConfirm] = useState(false);
-    const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
     const dragCounter = useRef(0);
 
     const [countdown] = useCountDown({
@@ -98,7 +98,9 @@ const GalleryHeader = () => {
         };
     }, []);
 
-    const debouncedSearch = useDebounce(search, { wait: 150 });
+    // 300ms debounce is the sweet spot: responsive enough for feedback,
+    // but prevents excessive filtering on every keystroke
+    const debouncedSearch = useDebounce(search, { wait: 300 });
 
     useEffect(() => {
         setSearchFileName(debouncedSearch);
@@ -132,25 +134,16 @@ const GalleryHeader = () => {
             FileSaver.saveAs(content, 'gallery-images.zip');
         } finally {
             setDownloading(false);
-            setShowDownloadConfirm(false);
         }
     };
 
     const handleDeleteSelected = async () => {
+        if (!selectedImages.length) return;
         setDeleting(true);
         try {
-            for (const url of selectedImages) {
-                try {
-                    await ComfyAppApi.deleteImage(url);
-                    await new Promise(res => setTimeout(res, 50));
-                } catch (e) {
-                    console.error('Failed to delete image:', url, e);
-                }
-            }
-            setSelectedImages([]);
+            await deleteImages(selectedImages);
         } finally {
             setDeleting(false);
-            setShowDeleteConfirm(false);
         }
     };
 
@@ -257,7 +250,12 @@ const GalleryHeader = () => {
 
                     {/* Download Selected */}
                     <button
-                        onClick={() => setShowDownloadConfirm(true)}
+                        onClick={async () => {
+                            if (downloading || selectedImages.length === 0) return;
+                            const confirmed = window.confirm(`Download ${selectedImages.length} images as a ZIP file?`);
+                            if (!confirmed) return;
+                            await handleDownloadSelected();
+                        }}
                         disabled={downloading}
                         className="selectedImagesActionButton"
                         style={{
@@ -282,7 +280,12 @@ const GalleryHeader = () => {
 
                     {/* Delete Selected */}
                     <button
-                        onClick={() => setShowDeleteConfirm(true)}
+                        onClick={async () => {
+                            if (deleting || selectedImages.length === 0) return;
+                            const confirmed = window.confirm(`Delete ${selectedImages.length} images?\nThis cannot be undone.`);
+                            if (!confirmed) return;
+                            await handleDeleteSelected();
+                        }}
                         disabled={deleting}
                         className="selectedImagesActionButton"
                         style={{
@@ -359,15 +362,83 @@ const GalleryHeader = () => {
             {/* Spacer */}
             <div style={{ flex: 1 }} />
 
-            {/* Search */}
-            <div style={{ position: 'relative', width: '320px' }}>
+            {/* Search mode toggle + Search */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0' }}>
+                {/* Search Mode Toggle - Segmented Control */}
+                <div
+                    style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        background: 'var(--bg-tertiary)',
+                        borderRadius: 'var(--radius-full) 0 0 var(--radius-full)',
+                        border: '1px solid var(--border-subtle)',
+                        borderRight: 'none',
+                        padding: '2px',
+                        height: '42px',
+                    }}
+                >
+                    {([
+                        { key: 'prompt' as const, label: 'Prompt', icon: '✨' },
+                        { key: 'filename' as const, label: 'Filename', icon: '📄' },
+                    ]).map(option => {
+                        const isActive = searchMode === option.key;
+                        return (
+                            <button
+                                key={option.key}
+                                onClick={() => setSearchMode(option.key)}
+                                type="button"
+                                style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '5px',
+                                    padding: '6px 12px',
+                                    borderRadius: 'var(--radius-full)',
+                                    border: 'none',
+                                    fontSize: '12px',
+                                    fontWeight: 600,
+                                    cursor: 'pointer',
+                                    color: isActive ? 'var(--bg-primary)' : 'var(--text-secondary)',
+                                    background: isActive
+                                        ? 'linear-gradient(135deg, var(--accent-primary), var(--accent-secondary, #00a8cc))'
+                                        : 'transparent',
+                                    boxShadow: isActive ? '0 2px 8px rgba(0, 212, 255, 0.3)' : 'none',
+                                    transition: 'all 200ms cubic-bezier(0.4, 0, 0.2, 1)',
+                                    transform: isActive ? 'scale(1)' : 'scale(0.98)',
+                                    opacity: isActive ? 1 : 0.7,
+                                }}
+                                onMouseEnter={e => {
+                                    if (!isActive) {
+                                        e.currentTarget.style.background = 'rgba(0, 212, 255, 0.15)';
+                                        e.currentTarget.style.opacity = '1';
+                                        e.currentTarget.style.transform = 'scale(1)';
+                                    }
+                                }}
+                                onMouseLeave={e => {
+                                    if (!isActive) {
+                                        e.currentTarget.style.background = 'transparent';
+                                        e.currentTarget.style.opacity = '0.7';
+                                        e.currentTarget.style.transform = 'scale(0.98)';
+                                    }
+                                }}
+                                title={option.key === 'prompt' ? 'Search in positive prompts (supports comma-separated terms)' : 'Search by file name'}
+                            >
+                                <span style={{ fontSize: '11px' }}>{option.icon}</span>
+                                {option.label}
+                            </button>
+                        );
+                    })}
+                </div>
+
+                {/* Search Input - Connected to toggle */}
+                <div style={{ position: 'relative', width: '260px' }}>
                 <div style={{
                     position: 'absolute',
-                    left: '12px',
+                        left: '14px',
                     top: '50%',
                     transform: 'translateY(-50%)',
-                    color: 'var(--text-muted)',
+                        color: searchMode === 'prompt' ? 'var(--accent-primary)' : 'var(--text-muted)',
                     pointerEvents: 'none',
+                        transition: 'color 200ms ease',
                 }}>
                     <IconSearch />
                 </div>
@@ -375,15 +446,16 @@ const GalleryHeader = () => {
                     type="text"
                     value={search}
                     onChange={e => setSearch(e.target.value)}
-                    placeholder="Search images..."
+                        placeholder={searchMode === 'prompt' ? 'e.g. car, sunset, beach…' : 'Search file name…'}
                     style={{
                         width: '100%',
-                        padding: '10px 12px 10px 40px',
+                            height: '42px',
+                            padding: '10px 36px 10px 42px',
                         background: 'var(--bg-tertiary)',
                         border: '1px solid var(--border-subtle)',
-                        borderRadius: 'var(--radius-full)',
+                            borderRadius: '0 var(--radius-full) var(--radius-full) 0',
                         color: 'var(--text-primary)',
-                        fontSize: '14px',
+                            fontSize: '13px',
                         outline: 'none',
                         transition: 'all 150ms ease',
                     }}
@@ -401,24 +473,34 @@ const GalleryHeader = () => {
                         onClick={() => setSearch('')}
                         style={{
                             position: 'absolute',
-                            right: '8px',
+                                right: '10px',
                             top: '50%',
                             transform: 'translateY(-50%)',
-                            width: '24px',
-                            height: '24px',
+                                width: '22px',
+                                height: '22px',
                             display: 'flex',
                             alignItems: 'center',
                             justifyContent: 'center',
                             background: 'var(--bg-elevated)',
                             border: 'none',
-                            borderRadius: 'var(--radius-sm)',
+                                borderRadius: '50%',
                             color: 'var(--text-muted)',
                             cursor: 'pointer',
+                                transition: 'all 150ms ease',
+                            }}
+                            onMouseEnter={e => {
+                                e.currentTarget.style.background = 'var(--accent-danger)';
+                                e.currentTarget.style.color = 'white';
+                            }}
+                            onMouseLeave={e => {
+                                e.currentTarget.style.background = 'var(--bg-elevated)';
+                                e.currentTarget.style.color = 'var(--text-muted)';
                         }}
                     >
                         <IconX />
                     </button>
                 )}
+                </div>
             </div>
 
             {/* Sort Controls */}
@@ -471,135 +553,7 @@ const GalleryHeader = () => {
                 <IconX />
             </button>
 
-            {/* Download Confirmation Modal */}
-            {showDownloadConfirm && (
-                <div
-                    style={{
-                        position: 'fixed',
-                        inset: 0,
-                        zIndex: 4000,
-                        background: 'rgba(0,0,0,0.6)',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                    }}
-                    onClick={() => setShowDownloadConfirm(false)}
-                >
-                    <div
-                        onClick={e => e.stopPropagation()}
-                        style={{
-                            background: 'var(--bg-secondary)',
-                            borderRadius: 'var(--radius-lg)',
-                            padding: '24px',
-                            maxWidth: '400px',
-                            border: '1px solid var(--border-subtle)',
-                            boxShadow: 'var(--shadow-lg)',
-                        }}
-                    >
-                        <h3 style={{ margin: '0 0 12px', color: 'var(--text-primary)', fontSize: '18px' }}>
-                            Download {selectedImages.length} images?
-                        </h3>
-                        <p style={{ margin: '0 0 20px', color: 'var(--text-secondary)', fontSize: '14px' }}>
-                            Images will be downloaded as a ZIP file.
-                        </p>
-                        <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
-                            <button
-                                onClick={() => setShowDownloadConfirm(false)}
-                                style={{
-                                    padding: '10px 20px',
-                                    background: 'var(--bg-tertiary)',
-                                    border: '1px solid var(--border-subtle)',
-                                    borderRadius: 'var(--radius-md)',
-                                    color: 'var(--text-secondary)',
-                                    cursor: 'pointer',
-                                }}
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                onClick={handleDownloadSelected}
-                                disabled={downloading}
-                                style={{
-                                    padding: '10px 20px',
-                                    background: 'var(--accent-primary)',
-                                    border: 'none',
-                                    borderRadius: 'var(--radius-md)',
-                                    color: 'var(--bg-primary)',
-                                    fontWeight: '600',
-                                    cursor: downloading ? 'wait' : 'pointer',
-                                }}
-                            >
-                                {downloading ? 'Downloading...' : 'Download'}
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
-
-            {/* Delete Confirmation Modal */}
-            {showDeleteConfirm && (
-                <div
-                    style={{
-                        position: 'fixed',
-                        inset: 0,
-                        zIndex: 4000,
-                        background: 'rgba(0,0,0,0.6)',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                    }}
-                    onClick={() => setShowDeleteConfirm(false)}
-                >
-                    <div
-                        onClick={e => e.stopPropagation()}
-                        style={{
-                            background: 'var(--bg-secondary)',
-                            borderRadius: 'var(--radius-lg)',
-                            padding: '24px',
-                            maxWidth: '400px',
-                            border: '1px solid var(--border-subtle)',
-                            boxShadow: 'var(--shadow-lg)',
-                        }}
-                    >
-                        <h3 style={{ margin: '0 0 12px', color: 'var(--accent-danger)', fontSize: '18px' }}>
-                            Delete {selectedImages.length} images?
-                        </h3>
-                        <p style={{ margin: '0 0 20px', color: 'var(--text-secondary)', fontSize: '14px' }}>
-                            This action cannot be undone. The images will be permanently deleted.
-                        </p>
-                        <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
-                            <button
-                                onClick={() => setShowDeleteConfirm(false)}
-                                style={{
-                                    padding: '10px 20px',
-                                    background: 'var(--bg-tertiary)',
-                                    border: '1px solid var(--border-subtle)',
-                                    borderRadius: 'var(--radius-md)',
-                                    color: 'var(--text-secondary)',
-                                    cursor: 'pointer',
-                                }}
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                onClick={handleDeleteSelected}
-                                disabled={deleting}
-                                style={{
-                                    padding: '10px 20px',
-                                    background: 'var(--accent-danger)',
-                                    border: 'none',
-                                    borderRadius: 'var(--radius-md)',
-                                    color: 'white',
-                                    fontWeight: '600',
-                                    cursor: deleting ? 'wait' : 'pointer',
-                                }}
-                            >
-                                {deleting ? 'Deleting...' : 'Delete Forever'}
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
+            {/* (Bulk confirmation now uses native window.confirm dialogs for reliability) */}
         </div>
     );
 };

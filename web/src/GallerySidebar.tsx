@@ -1,6 +1,5 @@
 import React, { useMemo, useCallback, memo, useRef, useState } from 'react';
 import { useGalleryContext } from './GalleryContext';
-import { useDrop } from 'ahooks';
 import { ComfyAppApi } from './ComfyAppApi';
 
 // Icons
@@ -104,7 +103,14 @@ const FolderItem = memo(({
     onSelect: (key: string) => void;
 }) => {
     const folderRef = useRef<HTMLDivElement>(null);
-    const { getLoadedItems, selectedImages, setSelectedImages, folderCounts } = useGalleryContext();
+    const {
+        getLoadedItems,
+        selectedImages,
+        setSelectedImages,
+        folderCounts,
+        rootFolder,
+        deleteFolder,
+    } = useGalleryContext();
     const [isHovered, setIsHovered] = useState(false);
     const [isDragOver, setDragOver] = useState(false);
 
@@ -120,6 +126,8 @@ const FolderItem = memo(({
     }, [getLoadedItems, node.key]);
 
     const allSelected = folderImages.length > 0 && folderImages.every(url => selectedImages.includes(url));
+    const isRootFolder = rootFolder && normalizeFolderKey(rootFolder) === node.key;
+    const isVirtualFavorites = node.key.endsWith('/_favorites') || node.title === '_favorites';
 
     // Handle folder click with ctrl for selection
     const handleClick = (e: React.MouseEvent) => {
@@ -138,24 +146,67 @@ const FolderItem = memo(({
         }
     };
 
-    // Handle drop for moving images
-    useDrop(folderRef, {
-        onDom: (content: any) => {
-            try {
-                const dragData = typeof content === 'string' ? JSON.parse(content) : content;
-                if (dragData?.name && dragData?.folder && dragData.folder !== node.key) {
-                    const sourcePath = `${dragData.folder}/${dragData.name}`;
-                    const targetPath = `${node.key}/${dragData.name}`;
-                    ComfyAppApi.moveImage(sourcePath, targetPath);
-                }
-            } catch (err) {
-                console.error('Error parsing drag data:', err);
+    // Native HTML5 drop handlers for reliable drag/drop
+    const handleDragOver = useCallback((e: React.DragEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = 'move';
+        setDragOver(true);
+    }, []);
+
+    const handleDragLeave = useCallback((e: React.DragEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setDragOver(false);
+    }, []);
+
+    const handleDrop = useCallback((e: React.DragEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setDragOver(false);
+
+        try {
+            // Try application/json first, then text/plain as fallback
+            let dataStr = e.dataTransfer.getData('application/json');
+            if (!dataStr) {
+                dataStr = e.dataTransfer.getData('text/plain');
             }
-            setDragOver(false);
-        },
-        onDragEnter: () => setDragOver(true),
-        onDragLeave: () => setDragOver(false),
-    });
+            if (!dataStr) {
+                console.error('No drag data received');
+                return;
+            }
+
+            const dragData = JSON.parse(dataStr);
+            console.log('Drop received:', dragData, 'Target folder:', node.key);
+
+            // Support both single-item and multi-item payloads
+            const items = Array.isArray(dragData?.items) && dragData.items.length
+                ? dragData.items
+                : (dragData?.name ? [dragData] : []);
+
+            for (const item of items) {
+                if (!item?.name || item.folder === undefined) continue;
+                if (item.folder === node.key) continue;
+
+                const sourcePath = `${item.folder}/${item.name}`;
+                const targetPath = `${node.key}/${item.name}`;
+                console.log('Moving image from', sourcePath, 'to', targetPath);
+                ComfyAppApi.moveImage(sourcePath, targetPath);
+            }
+        } catch (err) {
+            console.error('Error parsing drag data:', err);
+        }
+    }, [node.key]);
+
+    const handleDeleteFolder = useCallback(async (e: React.MouseEvent) => {
+        e.stopPropagation();
+        e.preventDefault();
+        if (isRootFolder || isVirtualFavorites) return;
+        const confirmed = window.confirm(`Delete folder "${node.title}" and all of its images? This cannot be undone.`);
+        if (!confirmed) return;
+
+        await deleteFolder(node.key);
+    }, [isRootFolder, isVirtualFavorites, node.title, node.key, deleteFolder]);
 
     return (
         <div style={{ userSelect: 'none' }}>
@@ -163,6 +214,9 @@ const FolderItem = memo(({
                 ref={folderRef}
                 className="folder"
                 onClick={handleClick}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
                 onMouseEnter={() => setIsHovered(true)}
                 onMouseLeave={() => setIsHovered(false)}
                 style={{
@@ -255,6 +309,29 @@ const FolderItem = memo(({
                         {count}
                     </span>
                 )}
+                {/* Delete Folder (non-root, non-virtual) */}
+                {!isRootFolder && !isVirtualFavorites && (
+                    <button
+                        onClick={handleDeleteFolder}
+                        title="Delete folder"
+                        style={{
+                            marginLeft: '4px',
+                            width: '20px',
+                            height: '20px',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            border: 'none',
+                            borderRadius: '4px',
+                            background: 'transparent',
+                            color: 'var(--text-muted)',
+                            cursor: 'pointer',
+                            fontSize: '14px',
+                        }}
+                    >
+                        🗑
+                    </button>
+                )}
             </div>
 
             {/* Children (animated) */}
@@ -284,7 +361,7 @@ const FolderItem = memo(({
 FolderItem.displayName = 'FolderItem';
 
 const GallerySidebar = () => {
-    const { folderCounts, rootFolder, loading, currentFolder, setCurrentFolder, siderCollapsed, settings } = useGalleryContext();
+    const { folderCounts, rootFolder, loading, currentFolder, setCurrentFolder, siderCollapsed, settings, refreshFolder } = useGalleryContext();
 
     // Normalize folder counts
     const normalizedCounts = useMemo(() => {
@@ -348,6 +425,10 @@ const GallerySidebar = () => {
                 padding: '8px 12px 16px',
                 borderBottom: '1px solid var(--border-subtle)',
                 marginBottom: '12px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '8px',
             }}>
                 <h3 style={{
                     margin: 0,
@@ -359,6 +440,34 @@ const GallerySidebar = () => {
                 }}>
                     Folders
                 </h3>
+                <button
+                    onClick={async () => {
+                        const name = prompt('New folder name');
+                        if (!name) return;
+                        const normalizedRoot = rootFolder || '';
+                        const target = normalizedRoot ? `${normalizedRoot}/${name}` : name;
+                        console.log('Creating folder:', target);
+                        const ok = await ComfyAppApi.createFolder(target);
+                        console.log('Create folder result:', ok);
+                        if (ok) {
+                            refreshFolder(rootFolder);
+                        } else {
+                            alert('Failed to create folder. Check console for details.');
+                        }
+                    }}
+                    style={{
+                        padding: '6px 10px',
+                        background: 'var(--bg-tertiary)',
+                        border: '1px solid var(--border-subtle)',
+                        borderRadius: '8px',
+                        color: 'var(--text-secondary)',
+                        fontSize: '12px',
+                        cursor: 'pointer',
+                    }}
+                    title="Create folder"
+                >
+                    + New
+                </button>
             </div>
 
             {/* Loading State */}

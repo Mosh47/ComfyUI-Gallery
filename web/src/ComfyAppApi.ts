@@ -199,6 +199,52 @@ export const ComfyAppApi = {
             return false;
         }
     },
+    // Rename image (implemented via move to same folder with new filename)
+    renameImage: async (folder: string, oldName: string, newName: string) => {
+        try {
+            if (!newName || newName === oldName) {
+                return true;
+            }
+            const sourcePath = `${folder}/${oldName}`;
+            const targetPath = `${folder}/${newName}`;
+            return await ComfyAppApi.moveImage(sourcePath, targetPath);
+        } catch (error) {
+            console.error("Error renaming image:", error);
+            return false;
+        }
+    },
+    // Create a new folder
+    createFolder: async (folderPath: string) => {
+        try {
+            const response = await app.api.fetchApi("/Gallery/folder/create", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ folder_path: folderPath })
+            });
+            return response?.ok ?? false;
+        } catch (error) {
+            console.error("Error creating folder:", error);
+            return false;
+        }
+    },
+    // Delete a folder and its contents
+    deleteFolder: async (folderPath: string) => {
+        try {
+            const response = await app.api.fetchApi("/Gallery/folder/delete", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ folder_path: folderPath })
+            });
+            if (!response?.ok) {
+                console.error("Failed to delete folder:", await response.text());
+                return false;
+            }
+            return true;
+        } catch (error) {
+            console.error("Error deleting folder:", error);
+            return false;
+        }
+    },
     // Settings endpoints
     fetchSettings: async () => {
         try {
@@ -217,7 +263,7 @@ export const ComfyAppApi = {
         } catch(e) { console.error(e); }
     },
     // Favorites endpoints
-    toggleFavorite: async (imagePath: string): Promise<{ success: boolean; isFavorite: boolean; newPath?: string }> => {
+    toggleFavorite: async (imagePath: string): Promise<{ success: boolean; isFavorite: boolean; favorites?: string[]; newPath?: string }> => {
         try {
             const response = await app.api.fetchApi("/Gallery/favorite/toggle", {
                 method: "POST",
@@ -226,7 +272,12 @@ export const ComfyAppApi = {
             });
             if (response.ok) {
                 const result = await response.json();
-                return { success: true, isFavorite: result.is_favorite, newPath: result.new_path };
+                return {
+                    success: true,
+                    isFavorite: !!result.is_favorite,
+                    favorites: Array.isArray(result.favorites) ? result.favorites : undefined,
+                    newPath: result.new_path,
+                };
             } else {
                 console.error("Failed to toggle favorite:", await response.text());
                 return { success: false, isFavorite: false };

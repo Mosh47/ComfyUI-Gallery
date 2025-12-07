@@ -5,6 +5,8 @@ import { ComfyAppApi, BASE_PATH, BASE_Z_INDEX } from './ComfyAppApi';
 import { useGalleryContext } from './GalleryContext';
 import { saveAs } from 'file-saver';
 import { getCachedMetadata } from './MetadataCache';
+import { useFavorite } from './useFavorite';
+import { favoritesStore } from './favoritesStore';
 
 // Icons
 const IconCopy = () => (
@@ -84,8 +86,16 @@ export function MetadataView({
     const [metadataError, setMetadataError] = useState<string | null>(null);
     const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
     const [deleting, setDeleting] = useState(false);
+    const [showRenameModal, setShowRenameModal] = useState(false);
+    const [renameValue, setRenameValue] = useState(image.name);
+    const [renaming, setRenaming] = useState(false);
 
-    const { updateFileMetadata, isFavorite, toggleFavorite } = useGalleryContext();
+    const { updateFileMetadata, refreshFolder, deleteImages } = useGalleryContext();
+    // Subscribe to THIS image's favorite status - granular updates
+    const isFavorite = useFavorite(image.url);
+    const toggleFavorite = useCallback(() => {
+        favoritesStore.toggleFavorite(image.url);
+    }, [image.url]);
 
     useEffect(() => {
         setMetadataError(null);
@@ -164,12 +174,35 @@ export function MetadataView({
     const handleDelete = useCallback(async () => {
         setDeleting(true);
         try {
-            await ComfyAppApi.deleteImage(image.url);
+            await deleteImages([image.url]);
         } finally {
             setDeleting(false);
             setShowDeleteConfirm(false);
         }
-    }, [image.url]);
+    }, [image.url, deleteImages]);
+
+    useEffect(() => {
+        setRenameValue(image.name);
+        setShowRenameModal(false);
+        setRenaming(false);
+    }, [image.name]);
+
+    const handleRename = useCallback(async () => {
+        if (!renameValue || renameValue === image.name) {
+            setShowRenameModal(false);
+            return;
+        }
+        setRenaming(true);
+        try {
+            const success = await ComfyAppApi.renameImage(image.folder, image.name, renameValue);
+            if (success) {
+                await refreshFolder(image.folder);
+                setShowRenameModal(false);
+            }
+        } finally {
+            setRenaming(false);
+        }
+    }, [image.url, image.folder, image.name, renameValue, refreshFolder]);
 
     const toggleSection = (section: string) => {
         setExpandedSections(prev => ({ ...prev, [section]: !prev[section] }));
@@ -293,27 +326,27 @@ export function MetadataView({
 
                 {/* Action Buttons */}
                 <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', justifyContent: 'center' }}>
-                    {/* Favorite Button */}
+                    {/* Favorite Button - uses subscription for granular updates */}
                     <button
-                        onClick={() => toggleFavorite(image)}
+                        onClick={toggleFavorite}
                         style={{
                             display: 'flex',
                             alignItems: 'center',
                             gap: '8px',
                             padding: '10px 16px',
-                            background: isFavorite(image.url) ? 'rgba(255, 215, 0, 0.9)' : 'var(--bg-tertiary)',
-                            border: isFavorite(image.url) ? '1px solid rgba(255, 215, 0, 1)' : '1px solid var(--border-subtle)',
+                            background: isFavorite ? 'rgba(255, 215, 0, 0.9)' : 'var(--bg-tertiary)',
+                            border: isFavorite ? '1px solid rgba(255, 215, 0, 1)' : '1px solid var(--border-subtle)',
                             borderRadius: '10px',
-                            color: isFavorite(image.url) ? '#1a1a1a' : 'var(--text-secondary)',
+                            color: isFavorite ? '#1a1a1a' : 'var(--text-secondary)',
                             fontSize: '13px',
                             fontWeight: '600',
                             cursor: 'pointer',
                             transition: 'all 150ms ease',
-                            boxShadow: isFavorite(image.url) ? '0 2px 12px rgba(255, 215, 0, 0.3)' : 'none',
+                            boxShadow: isFavorite ? '0 2px 12px rgba(255, 215, 0, 0.3)' : 'none',
                         }}
                     >
-                        {isFavorite(image.url) ? <IconStarFilled /> : <IconStarOutline />}
-                        {isFavorite(image.url) ? 'Favorited' : 'Favorite'}
+                        {isFavorite ? <IconStarFilled /> : <IconStarOutline />}
+                        {isFavorite ? 'Favorited' : 'Favorite'}
                     </button>
                     {image.type === 'image' && (
                         <button
@@ -376,6 +409,25 @@ export function MetadataView({
                     >
                         <IconCode />
                         Raw JSON
+                    </button>
+                    <button
+                        onClick={() => setShowRenameModal(true)}
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            padding: '10px 16px',
+                            background: 'var(--bg-tertiary)',
+                            border: '1px solid var(--border-subtle)',
+                            borderRadius: '10px',
+                            color: 'var(--text-secondary)',
+                            fontSize: '13px',
+                            fontWeight: '500',
+                            cursor: 'pointer',
+                            transition: 'all 150ms ease',
+                        }}
+                    >
+                        Rename
                     </button>
                     <button
                         onClick={() => setShowDeleteConfirm(true)}
@@ -754,6 +806,93 @@ export function MetadataView({
                                     fontSize: '13px',
                                 }}
                             />
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Rename Modal */}
+            {showRenameModal && (
+                <div
+                    style={{
+                        position: 'fixed',
+                        inset: 0,
+                        zIndex: BASE_Z_INDEX + 3,
+                        background: 'rgba(0, 0, 0, 0.7)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                    }}
+                    onClick={() => setShowRenameModal(false)}
+                >
+                    <div
+                        onClick={e => e.stopPropagation()}
+                        style={{
+                            background: 'var(--bg-secondary)',
+                            borderRadius: '16px',
+                            padding: '24px',
+                            maxWidth: '420px',
+                            width: '100%',
+                            border: '1px solid var(--border-subtle)',
+                        }}
+                    >
+                        <h3 style={{ margin: '0 0 12px', color: 'var(--text-primary)', fontSize: '18px' }}>
+                            Rename image
+                        </h3>
+                        <p style={{ margin: '0 0 12px', color: 'var(--text-secondary)', fontSize: '13px' }}>
+                            Current name: {image.name}
+                        </p>
+                        <input
+                            value={renameValue}
+                            onChange={e => setRenameValue(e.target.value)}
+                            onKeyDown={e => {
+                                if (e.key === 'Enter' && renameValue && !renaming) {
+                                    handleRename();
+                                }
+                            }}
+                            style={{
+                                width: '100%',
+                                padding: '10px 12px',
+                                borderRadius: '10px',
+                                border: '1px solid var(--border-subtle)',
+                                background: 'var(--bg-tertiary)',
+                                color: 'var(--text-primary)',
+                                fontSize: '14px',
+                                marginBottom: '16px',
+                                outline: 'none',
+                            }}
+                            autoFocus
+                        />
+                        <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
+                            <button
+                                onClick={() => setShowRenameModal(false)}
+                                style={{
+                                    padding: '10px 20px',
+                                    background: 'var(--bg-tertiary)',
+                                    border: '1px solid var(--border-subtle)',
+                                    borderRadius: '10px',
+                                    color: 'var(--text-secondary)',
+                                    cursor: 'pointer',
+                                }}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleRename}
+                                disabled={renaming || !renameValue}
+                                style={{
+                                    padding: '10px 20px',
+                                    background: 'var(--accent-primary)',
+                                    border: 'none',
+                                    borderRadius: '10px',
+                                    color: 'var(--bg-primary)',
+                                    fontWeight: '600',
+                                    cursor: renaming ? 'wait' : 'pointer',
+                                    opacity: renaming ? 0.7 : 1,
+                                }}
+                            >
+                                {renaming ? 'Renaming...' : 'Rename'}
+                            </button>
                         </div>
                     </div>
                 </div>

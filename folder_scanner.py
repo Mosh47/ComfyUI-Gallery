@@ -127,9 +127,13 @@ def _scan_for_images(full_base_path, base_path, include_subfolders, allowed_exte
                 folders_data[folder_key][filename] = entry_data
                 folder_content[filename] = entry_data
 
+        # Always register the folder itself, even if it is currently empty.
+        # This allows newly created folders (with no images yet) to appear in the UI.
+        folder_key = os.path.join(base_path, relative_path) if relative_path else base_path
+        if folder_key not in folders_data:
+            folders_data[folder_key] = {}
         if folder_content:
-            folder_key = os.path.join(base_path, relative_path) if relative_path else base_path
-            folders_data.setdefault(folder_key, {}).update(folder_content)
+            folders_data[folder_key].update(folder_content)
 
     scan_directory(full_base_path, "")
     return folders_data, False

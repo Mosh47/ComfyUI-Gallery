@@ -6,6 +6,8 @@ import { useGalleryContext } from './GalleryContext';
 import { MetadataView } from './MetadataView';
 import type { FileDetails } from './types';
 import { BASE_PATH, BASE_Z_INDEX } from "./ComfyAppApi";
+import { useFavorite } from './useFavorite';
+import { favoritesStore } from './favoritesStore';
 
 // Icons
 const IconImage = () => (
@@ -46,6 +48,40 @@ const IconStarFilled = () => (
     </svg>
 );
 
+// Separate component for preview star button - uses useFavorite hook for granular updates
+const PreviewFavoriteButton: React.FC<{ url: string }> = ({ url }) => {
+    const isFavorite = useFavorite(url);
+    return (
+        <button
+            onClick={(e) => {
+                e.stopPropagation();
+                favoritesStore.toggleFavorite(url);
+            }}
+            style={{
+                position: 'absolute',
+                top: '20px',
+                left: '20px',
+                width: '48px',
+                height: '48px',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                background: isFavorite ? 'rgba(255, 215, 0, 0.9)' : 'rgba(255, 255, 255, 0.1)',
+                border: 'none',
+                borderRadius: '50%',
+                color: isFavorite ? '#1a1a1a' : 'white',
+                cursor: 'pointer',
+                transition: 'all 150ms ease',
+                zIndex: 10,
+                boxShadow: isFavorite ? '0 4px 20px rgba(255, 215, 0, 0.4)' : 'none',
+            }}
+            title={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+        >
+            {isFavorite ? <IconStarFilled /> : <IconStarOutline />}
+        </button>
+    );
+};
+
 const GalleryImageGrid = () => {
     const {
         gridSize,
@@ -62,8 +98,6 @@ const GalleryImageGrid = () => {
         loadMore,
         hasMore,
         isLoadingMore,
-        isFavorite,
-        toggleFavorite,
     } = useGalleryContext();
 
     const containerRef = useRef<HTMLDivElement>(null);
@@ -90,6 +124,17 @@ const GalleryImageGrid = () => {
         imagesDetailsList.filter(img => img.type === "image" || img.type === "media" || img.type === "audio"),
         [imagesDetailsList]
     );
+
+    // If the currently previewed/info image disappears (delete/move), close the modals gracefully
+    useEffect(() => {
+        if (previewImageName && !previewableImages.some(img => img.name === previewImageName)) {
+            setPreviewImageName(null);
+        }
+        if (infoImageName && !previewableImages.some(img => img.name === infoImageName)) {
+            setInfoImageName(null);
+            setImageInfoName(undefined);
+        }
+    }, [previewableImages, previewImageName, infoImageName, setImageInfoName]);
 
     // Handle clicking on an image - opens simple preview
     const handleImageClick = useCallback((imageName: string) => {
@@ -150,90 +195,104 @@ const GalleryImageGrid = () => {
         return () => window.removeEventListener('keydown', handleKeyDown, true);
     }, [previewImageName, infoImageName, navigatePreview, setImageInfoName]);
 
-    // Grid cell renderer
-    const Cell = useMemo(() => {
-        const MemoCell = React.memo(
-            ({ columnIndex, rowIndex, style }: { columnIndex: number; rowIndex: number; style: React.CSSProperties }) => {
-                const index = rowIndex * gridSize.columnCount + columnIndex;
-                const image = imagesDetailsList[index];
+    // Stable cell renderer - uses itemData pattern from react-window best practices
+    // Cell function doesn't capture imagesDetailsList in closure - receives data via props
+    const Cell = useCallback(
+        ({ columnIndex, rowIndex, style, data }: {
+            columnIndex: number;
+            rowIndex: number;
+            style: React.CSSProperties;
+            data: {
+                items: FileDetails[];
+                columnCount: number;
+                onImageClick: (name: string) => void;
+                onInfoClick: (name: string) => void;
+            };
+        }) => {
+            const { items, columnCount, onImageClick, onInfoClick } = data;
+            const index = rowIndex * columnCount + columnIndex;
+            const image = items[index];
 
-                if (!image) return null;
+            if (!image) return null;
 
-                // Date divider
-                if (image.type === 'divider') {
-                    if (columnIndex !== 0) return null;
+            // Date divider
+            if (image.type === 'divider') {
+                if (columnIndex !== 0) return null;
 
-                    return (
-                        <div
-                            style={{
-                                ...style,
-                                width: `${gridSize.columnCount * (ImageCardWidth + 16)}px`,
-                                display: 'flex',
-                                alignItems: 'center',
-                                justifyContent: 'center',
-                                padding: '16px 0',
-                                position: 'absolute',
-                                zIndex: 2,
-                            }}
-                        >
-                            <div style={{
-                                flex: 1,
-                                height: '1px',
-                                background: 'linear-gradient(to right, transparent, var(--border-strong), transparent)',
-                            }} />
-                            <span style={{
-                                padding: '8px 24px',
-                                background: 'var(--bg-tertiary)',
-                                border: '1px solid var(--border-subtle)',
-                                borderRadius: '999px',
-                                fontSize: '13px',
-                                fontWeight: '600',
-                                color: 'var(--text-secondary)',
-                                whiteSpace: 'nowrap',
-                            }}>
-                                {image.name}
-                            </span>
-                            <div style={{
-                                flex: 1,
-                                height: '1px',
-                                background: 'linear-gradient(to right, var(--border-strong), transparent)',
-                            }} />
-                        </div>
-                    );
-                }
-
-                // Empty space filler
-                if (image.type === 'empty-space') {
-                    return <div style={{ ...style, background: 'transparent' }} />;
-                }
-
-                // Regular image card
                 return (
                     <div
                         style={{
                             ...style,
+                            width: `${columnCount * (ImageCardWidth + 16)}px`,
                             display: 'flex',
-                            justifyContent: 'center',
                             alignItems: 'center',
-                            padding: '8px',
+                            justifyContent: 'center',
+                            padding: '16px 0',
+                            position: 'absolute',
+                            zIndex: 2,
                         }}
                     >
-                        <ImageCard
-                            image={{ ...image, dragFolder: image.folder }}
-                            index={index}
-                            onImageClick={() => handleImageClick(image.name)}
-                            onInfoClick={() => handleInfoClick(image.name)}
-                            onFavoriteToggle={() => toggleFavorite(image)}
-                            isFavorite={isFavorite(image.url)}
-                        />
+                        <div style={{
+                            flex: 1,
+                            height: '1px',
+                            background: 'linear-gradient(to right, transparent, var(--border-strong), transparent)',
+                        }} />
+                        <span style={{
+                            padding: '8px 24px',
+                            background: 'var(--bg-tertiary)',
+                            border: '1px solid var(--border-subtle)',
+                            borderRadius: '999px',
+                            fontSize: '13px',
+                            fontWeight: '600',
+                            color: 'var(--text-secondary)',
+                            whiteSpace: 'nowrap',
+                        }}>
+                            {image.name}
+                        </span>
+                        <div style={{
+                            flex: 1,
+                            height: '1px',
+                            background: 'linear-gradient(to right, var(--border-strong), transparent)',
+                        }} />
                     </div>
                 );
-            },
-            (prev, next) => prev.columnIndex === next.columnIndex && prev.rowIndex === next.rowIndex
-        );
-        MemoCell.displayName = 'GalleryGridCell';
-        return MemoCell;
-    }, [gridSize.columnCount, imagesDetailsList, handleImageClick, handleInfoClick, toggleFavorite, isFavorite]);
+            }
+
+            // Empty space filler
+            if (image.type === 'empty-space') {
+                return <div style={{ ...style, background: 'transparent' }} />;
+            }
+
+            // Regular image card - favorites handled internally via useFavorite hook
+            return (
+                <div
+                    style={{
+                        ...style,
+                        display: 'flex',
+                        justifyContent: 'center',
+                        alignItems: 'center',
+                        padding: '8px',
+                    }}
+                >
+                    <ImageCard
+                        image={{ ...image, dragFolder: image.folder }}
+                        index={index}
+                        onImageClick={() => onImageClick(image.name)}
+                        onInfoClick={() => onInfoClick(image.name)}
+                    />
+                </div>
+            );
+        },
+        [] // No dependencies - receives all data via props
+    );
+
+    // Memoize itemData to prevent unnecessary re-renders
+    const itemData = useMemo(() => ({
+        items: imagesDetailsList,
+        columnCount: gridSize.columnCount,
+        onImageClick: handleImageClick,
+        onInfoClick: handleInfoClick,
+    }), [imagesDetailsList, gridSize.columnCount, handleImageClick, handleInfoClick]);
 
     // Update grid size when container changes
     useEffect(() => {
@@ -331,6 +390,13 @@ const GalleryImageGrid = () => {
                                     width={width}
                                     height={height}
                                     onScroll={handleScroll}
+                                    itemData={itemData}
+                                    itemKey={({ columnIndex, rowIndex, data }) => {
+                                        const index = rowIndex * data.columnCount + columnIndex;
+                                        const item = data.items[index];
+                                        // Use URL as stable key, fallback to position for dividers/empty
+                                        return item?.url || `${rowIndex}-${columnIndex}`;
+                                    }}
                                     style={{
                                         overflowX: 'hidden',
                                     }}
@@ -436,34 +502,8 @@ const GalleryImageGrid = () => {
                         <IconX />
                     </button>
 
-                    {/* Favorite Star Button */}
-                    <button
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            toggleFavorite(previewImage);
-                        }}
-                        style={{
-                            position: 'absolute',
-                            top: '20px',
-                            left: '20px',
-                            width: '48px',
-                            height: '48px',
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            background: isFavorite(previewImage.url) ? 'rgba(255, 215, 0, 0.9)' : 'rgba(255, 255, 255, 0.1)',
-                            border: 'none',
-                            borderRadius: '50%',
-                            color: isFavorite(previewImage.url) ? '#1a1a1a' : 'white',
-                            cursor: 'pointer',
-                            transition: 'all 150ms ease',
-                            zIndex: 10,
-                            boxShadow: isFavorite(previewImage.url) ? '0 4px 20px rgba(255, 215, 0, 0.4)' : 'none',
-                        }}
-                        title={isFavorite(previewImage.url) ? 'Remove from favorites' : 'Add to favorites'}
-                    >
-                        {isFavorite(previewImage.url) ? <IconStarFilled /> : <IconStarOutline />}
-                    </button>
+                    {/* Favorite Star Button - uses subscription for granular updates */}
+                    <PreviewFavoriteButton url={previewImage.url} />
 
                     {/* Navigation Arrows */}
                     <button

@@ -1,8 +1,9 @@
-import React, { useEffect, useRef, useState, useMemo } from 'react';
+import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import type { FileDetails } from './types';
-import { useDrag } from 'ahooks';
 import { useGalleryContext } from './GalleryContext';
 import { BASE_PATH } from './ComfyAppApi';
+import { useFavorite } from './useFavorite';
+import { favoritesStore } from './favoritesStore';
 
 export const ImageCardWidth = 280;
 export const ImageCardHeight = 320;
@@ -45,22 +46,30 @@ const IconStarFilled = () => (
 );
 
 
-function ImageCard({
+const ImageCard = React.memo(function ImageCard({
     image,
     index,
     onImageClick,
     onInfoClick,
-    onFavoriteToggle,
-    isFavorite,
 }: {
     image: FileDetails & { dragFolder?: string };
     index: number;
     onImageClick: () => void;  // Click on image = full preview
     onInfoClick: () => void;   // Click info = metadata panel
-    onFavoriteToggle?: () => void;  // Toggle favorite status
-    isFavorite?: boolean;  // Whether the image is favorited
 }) {
-    const { settings, selectedImages, setSelectedImages } = useGalleryContext();
+    const {
+        settings,
+        selectedImages,
+        setSelectedImages,
+        imagesDetailsList,
+        lastSelectedIndex,
+        setLastSelectedIndex,
+    } = useGalleryContext();
+    // Subscribe to THIS image's favorite status only - won't re-render other cards
+    const isFavorite = useFavorite(image.url);
+    const onFavoriteToggle = useCallback(() => {
+        favoritesStore.toggleFavorite(image.url);
+    }, [image.url]);
     const dragRef = useRef<HTMLDivElement>(null);
     const [dragging, setDragging] = useState(false);
     const [isVisible, setIsVisible] = useState(false);
@@ -70,19 +79,49 @@ function ImageCard({
 
     const isSelected = selectedImages.includes(image.url);
 
-    useDrag(
-        {
-            name: image.name,
-            folder: image.dragFolder || '',
-            type: image.type,
-            url: image.url,
-        },
-        dragRef,
-        {
-            onDragStart: () => setDragging(true),
-            onDragEnd: () => setDragging(false),
-        }
+    // Order of selectable media (no dividers/empty items) for range selection
+    const selectableImages = useMemo(
+        () => imagesDetailsList.filter(img => img && (img.type === 'image' || img.type === 'media' || img.type === 'audio')),
+        [imagesDetailsList]
     );
+
+    // Native HTML5 drag handlers for reliable cross-element drag/drop
+    // If multiple images are selected and the dragged image is part of the selection,
+    // we send the whole selection as a group so the drop target can move them all.
+    const handleDragStart = useCallback((e: React.DragEvent) => {
+        setDragging(true);
+
+        let items: Array<{ name: string; folder: string; type: string; url: string }> = [];
+        const isPartOfSelection = selectedImages.includes(image.url);
+
+        if (isPartOfSelection && selectedImages.length > 1) {
+            const selectedSet = new Set(selectedImages);
+            items = imagesDetailsList
+                .filter(img => selectedSet.has(img.url))
+                .map(img => ({
+                    name: img.name,
+                    folder: img.folder,
+                    type: img.type,
+                    url: img.url,
+                }));
+        } else {
+            items = [{
+                name: image.name,
+                folder: image.dragFolder || image.folder || '',
+                type: image.type,
+                url: image.url,
+            }];
+        }
+
+        const dragData = JSON.stringify({ items });
+        e.dataTransfer.setData('application/json', dragData);
+        e.dataTransfer.setData('text/plain', dragData); // Fallback
+        e.dataTransfer.effectAllowed = 'move';
+    }, [image.name, image.folder, image.dragFolder, image.type, image.url, selectedImages, imagesDetailsList]);
+
+    const handleDragEnd = useCallback(() => {
+        setDragging(false);
+    }, []);
 
     // Intersection Observer for lazy loading
     useEffect(() => {
@@ -115,6 +154,25 @@ function ImageCard({
     }, [image.url]);
 
     const handleCardClick = (event: React.MouseEvent) => {
+        if (event.shiftKey) {
+            event.stopPropagation();
+            event.preventDefault();
+
+            const orderedUrls = selectableImages.map(img => img.url);
+            const currentIdx = orderedUrls.indexOf(image.url);
+            if (currentIdx === -1) {
+                return;
+            }
+
+            const anchor = lastSelectedIndex >= 0 ? lastSelectedIndex : currentIdx;
+            const [start, end] = anchor <= currentIdx ? [anchor, currentIdx] : [currentIdx, anchor];
+            const rangeUrls = orderedUrls.slice(start, end + 1);
+
+            setSelectedImages(prev => Array.from(new Set([...prev, ...rangeUrls])));
+            setLastSelectedIndex(currentIdx);
+            return;
+        }
+
         if (event.ctrlKey || event.metaKey) {
             // Ctrl+click = select/deselect
             event.stopPropagation();
@@ -125,23 +183,15 @@ function ImageCard({
                 }
                 return [...prev, image.url];
             });
+            const currentIdx = selectableImages.findIndex(img => img.url === image.url);
+            if (currentIdx !== -1) setLastSelectedIndex(currentIdx);
         } else {
             // Normal click = open full preview
             setSelectedImages([]);
+            const currentIdx = selectableImages.findIndex(img => img.url === image.url);
+            if (currentIdx !== -1) setLastSelectedIndex(currentIdx);
             onImageClick();
         }
-    };
-
-    const handleNativeDragStart = (event: React.DragEvent) => {
-        const ext = (image.name || image.url).split('.').pop()?.toLowerCase() || '';
-        const mimeMap: Record<string, string> = {
-            jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
-            webp: 'image/webp', mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
-            mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', flac: 'audio/flac',
-        };
-        const mimeType = mimeMap[ext] || 'application/octet-stream';
-        event.dataTransfer.setData('text/uri-list', `${BASE_PATH}${image.url}`);
-        event.dataTransfer.setData('DownloadURL', `${mimeType}:${image.name}:${window.location.origin + BASE_PATH + image.url}`);
     };
 
     const thumbnailUrl = useMemo(() => {
@@ -152,13 +202,13 @@ function ImageCard({
         return null;
     }, [image.url, image.type]);
 
-    // Animation delay based on index for staggered effect
-    const animationDelay = Math.min(index * 30, 300);
-
     return (
         <div
             ref={dragRef}
             className="image-card"
+            draggable
+            onDragStart={handleDragStart}
+            onDragEnd={handleDragEnd}
             onClick={handleCardClick}
             onMouseEnter={() => setIsHovered(true)}
             onMouseLeave={() => setIsHovered(false)}
@@ -169,10 +219,12 @@ function ImageCard({
                 overflow: 'hidden',
                 position: 'relative',
                 cursor: dragging ? 'grabbing' : 'pointer',
-                background: 'var(--bg-tertiary)',
-                border: `2px solid ${isSelected ? 'var(--accent-primary)' : 'transparent'}`,
+                background: isSelected ? 'rgba(0, 212, 255, 0.08)' : 'var(--bg-tertiary)',
+                border: isSelected
+                    ? '2px solid var(--accent-primary)'
+                    : '2px solid rgba(255, 255, 255, 0.06)',
                 boxShadow: isSelected
-                    ? '0 0 0 3px rgba(0, 212, 255, 0.25), 0 8px 32px rgba(0, 0, 0, 0.4)'
+                    ? '0 0 0 2px rgba(0, 212, 255, 0.8), 0 0 30px rgba(0, 212, 255, 0.6)'
                     : isHovered
                         ? '0 8px 32px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255,255,255,0.1)'
                         : '0 4px 12px rgba(0, 0, 0, 0.2)',
@@ -183,7 +235,6 @@ function ImageCard({
                         : 'translateY(0) scale(1)',
                 transition: 'all 250ms cubic-bezier(0.4, 0, 0.2, 1)',
                 opacity: dragging ? 0.7 : 1,
-                animation: `fadeInUp 400ms ease-out ${animationDelay}ms backwards`,
             }}
         >
             {/* Selection Indicator */}
@@ -207,13 +258,12 @@ function ImageCard({
                 </div>
             )}
 
-            {/* Favorite Star Button */}
-            {onFavoriteToggle && (
-                <button
-                    onClick={(e) => {
-                        e.stopPropagation();
-                        onFavoriteToggle();
-                    }}
+            {/* Favorite Star Button - each card subscribes to its own status */}
+            <button
+                onClick={(e) => {
+                    e.stopPropagation();
+                    onFavoriteToggle();
+                }}
                     style={{
                         position: 'absolute',
                         top: '12px',
@@ -253,7 +303,6 @@ function ImageCard({
                 >
                     {isFavorite ? <IconStarFilled /> : <IconStarOutline />}
                 </button>
-            )}
 
             {/* Skeleton Loading State */}
             {!isVisible && (
@@ -281,8 +330,7 @@ function ImageCard({
                     <img
                         src={thumbnailUrl!}
                         alt={image.name}
-                        draggable
-                        onDragStart={handleNativeDragStart}
+                        draggable={false}
                         onLoad={() => setImageLoaded(true)}
                         onError={() => setImageError(true)}
                         style={{
@@ -292,10 +340,6 @@ function ImageCard({
                             opacity: imageLoaded ? 1 : 0,
                             transform: isHovered ? 'scale(1.08)' : 'scale(1)',
                             transition: 'all 400ms cubic-bezier(0.4, 0, 0.2, 1)',
-                        }}
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            onImageClick();
                         }}
                     />
                 </>
@@ -310,18 +354,13 @@ function ImageCard({
                         loop
                         muted
                         playsInline
-                        draggable
-                        onDragStart={handleNativeDragStart}
+                        draggable={false}
                         style={{
                             width: '100%',
                             height: '100%',
                             objectFit: 'cover',
                             transform: isHovered ? 'scale(1.05)' : 'scale(1)',
                             transition: 'transform 400ms ease',
-                        }}
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            onImageClick();
                         }}
                     />
                     {/* Play Icon Overlay */}
@@ -456,11 +495,11 @@ function ImageCard({
                 </div>
             </div>
 
-            {/* Type Badge - positioned below favorite star if present */}
+            {/* Type Badge - positioned below favorite star */}
             {image.type !== 'image' && (
                 <div style={{
                     position: 'absolute',
-                    top: onFavoriteToggle ? '56px' : '12px',
+                    top: '56px',
                     right: '12px',
                     padding: '4px 10px',
                     background: image.type === 'media' ? 'var(--accent-secondary)' : 'var(--accent-tertiary)',
@@ -504,6 +543,15 @@ function ImageCard({
             `}</style>
         </div>
     );
-}
+}, (prevProps, nextProps) => {
+    // Custom comparison: only re-render if relevant props change
+    return (
+        prevProps.image.url === nextProps.image.url &&
+        prevProps.image.name === nextProps.image.name &&
+        prevProps.image.type === nextProps.image.type &&
+        prevProps.index === nextProps.index
+        // Note: onImageClick and onInfoClick are stable due to useCallback in parent
+    );
+});
 
 export default ImageCard;

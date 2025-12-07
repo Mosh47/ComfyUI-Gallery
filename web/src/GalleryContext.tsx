@@ -15,6 +15,8 @@ import type { FileDetails, FolderListResponse, PaginatedImagesResponse } from '.
 import type { AutoCompleteProps } from 'antd/es/auto-complete';
 import { ComfyAppApi, BASE_PATH, OPEN_BUTTON_ID } from './ComfyAppApi';
 import { clearMetadataCache, invalidateMetadataCacheByUrl } from './MetadataCache';
+import { parseComfyMetadata } from './metadata-parser/metadataParser';
+import { favoritesStore } from './favoritesStore';
 
 type FolderState = {
     items: FileDetails[];
@@ -25,6 +27,7 @@ type FolderState = {
 };
 
 const DEFAULT_PAGE_SIZE = 120;
+const FAVORITES_FOLDER = '_favorites';
 
 const normalizeFolderKey = (value: string) => (value ? value.replace(/\\/g, "/") : "");
 
@@ -83,6 +86,8 @@ export interface GalleryContextType {
     error: any;
     searchFileName: string;
     setSearchFileName: Dispatch<SetStateAction<string>>;
+    searchMode: 'prompt' | 'filename';
+    setSearchMode: Dispatch<SetStateAction<'prompt' | 'filename'>>;
     showDateDivider: boolean;
     showSettings: boolean;
     setShowSettings: Dispatch<SetStateAction<boolean>>;
@@ -114,10 +119,11 @@ export interface GalleryContextType {
     siderCollapsed: boolean;
     setSiderCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
     updateFileMetadata: (folder: string, filename: string, metadata: any, metadataPending: boolean) => void;
-    // Favorites
-    favorites: Set<string>;
-    isFavorite: (url: string) => boolean;
-    toggleFavorite: (image: FileDetails) => Promise<void>;
+    lastSelectedIndex: number;
+    setLastSelectedIndex: Dispatch<SetStateAction<number>>;
+    deleteImages: (urls: string[]) => Promise<void>;
+    deleteFolder: (folderKey: string) => Promise<void>;
+    // Favorites are now handled by favoritesStore + useFavorite hook for granular updates
 }
 
 const GalleryContext = createContext<GalleryContextType | undefined>(undefined);
@@ -127,7 +133,13 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
     const [rootFolder, setRootFolder] = useState("");
     const [folderCounts, setFolderCounts] = useState<Record<string, number>>({});
     const [folderData, setFolderData] = useState<Record<string, FolderState>>({});
+    const folderDataRef = useRef<Record<string, FolderState>>({});
+    // Keep ref in sync with state for use in callbacks without re-triggering effects
+    useEffect(() => {
+        folderDataRef.current = folderData;
+    }, [folderData]);
     const [searchFileName, setSearchFileName] = useState("");
+    const [searchMode, setSearchMode] = useState<'prompt' | 'filename'>('prompt');
     const [showSettings, setShowSettings] = useState(false);
     const [showRawMetadata, setShowRawMetadata] = useState(false);
     const [sortMethod, setSortMethod] = useState<'Newest' | 'Oldest' | 'Name ↑' | 'Name ↓'>("Newest");
@@ -136,9 +148,8 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
     const [previewingVideo, setPreviewingVideo] = useState<string | undefined>(undefined);
     const [selectedImages, setSelectedImages] = useState<string[]>([]);
     const [siderCollapsed, setSiderCollapsed] = useState(true);
-    const [favorites, setFavorites] = useState<Set<string>>(new Set());
-    // Track when we're actively favoriting to suppress file watcher events
-    const suppressFileWatcherRef = useRef(false);
+    const [lastSelectedIndex, setLastSelectedIndex] = useState<number>(-1);
+    // Favorites are now in favoritesStore (subscription-based for granular updates)
     const size = useSize(document.querySelector('body'));
     const imagesBoxSize = useSize(document.querySelector('#imagesBox'));
     const [gridSize, setGridSize] = useState({ width: 1000, height: 600, columnCount: 1, rowCount: 1 });
@@ -151,6 +162,53 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
     const [loading, setLoading] = useState(false);
     const [loadingFolders, setLoadingFolders] = useState<Record<string, boolean>>({});
     const [error, setError] = useState<any>(null);
+
+    // Prompt search index (url -> positive prompt lowercased)
+    // Stored in ref to avoid re-renders when index updates
+    const promptIndexRef = useRef<Map<string, string>>(new Map());
+
+    // ========================================================================
+    // DELETED FOLDERS GRACE PERIOD TRACKING
+    // When a folder is deleted, we track it here to ignore real-time events
+    // that might try to re-add it before the backend fully processes the deletion.
+    // Map<normalizedFolderKey, deletionTimestamp>
+    // ========================================================================
+    const deletedFoldersRef = useRef<Map<string, number>>(new Map());
+    const DELETED_FOLDER_GRACE_PERIOD_MS = 10000; // 10 seconds grace period
+
+    // Check if a folder (or any of its parents) is in the deleted grace period
+    const isFolderDeletePending = useCallback((folderKey: string): boolean => {
+        const normalized = normalizeFolderKey(folderKey);
+        if (!normalized) return false;
+
+        const now = Date.now();
+        // Check this exact folder
+        const deletedAt = deletedFoldersRef.current.get(normalized);
+        if (deletedAt && now - deletedAt < DELETED_FOLDER_GRACE_PERIOD_MS) {
+            return true;
+        }
+
+        // Check if any parent folder is deleted (subfolder of a deleted folder)
+        for (const [deletedFolder, timestamp] of deletedFoldersRef.current.entries()) {
+            if (now - timestamp < DELETED_FOLDER_GRACE_PERIOD_MS) {
+                if (normalized.startsWith(deletedFolder + '/')) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }, []);
+
+    // Cleanup stale entries from deletedFoldersRef periodically
+    const cleanupDeletedFoldersTracking = useCallback(() => {
+        const now = Date.now();
+        for (const [folder, timestamp] of deletedFoldersRef.current.entries()) {
+            if (now - timestamp > DELETED_FOLDER_GRACE_PERIOD_MS * 2) {
+                deletedFoldersRef.current.delete(folder);
+            }
+        }
+    }, []);
 
     const currentFolder = normalizeFolderKey(currentFolderInternal);
     const currentFolderRef = useRef<string>(currentFolder);
@@ -186,12 +244,14 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
             if (payload?.folders) {
                 Object.entries(payload.folders).forEach(([key, value]) => {
                     const normalizedKey = normalizeFolderKey(key);
+                    // Skip folders that are pending deletion
+                    if (isFolderDeletePending(normalizedKey)) return;
                     const numericValue = typeof value?.count === 'number' ? value.count : Number(value?.count ?? 0);
                     normalizedFolders[normalizedKey] = Number.isFinite(numericValue) ? numericValue : 0;
                 });
             }
             const normalizedRoot = normalizeFolderKey(payload?.root || Object.keys(normalizedFolders)[0] || rootFolder);
-            if (normalizedRoot && !(normalizedRoot in normalizedFolders)) {
+            if (normalizedRoot && !(normalizedRoot in normalizedFolders) && !isFolderDeletePending(normalizedRoot)) {
                 normalizedFolders[normalizedRoot] = normalizedFolders[normalizedRoot] ?? 0;
             }
             setRootFolder(normalizedRoot);
@@ -199,6 +259,8 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
             setFolderData(prev => {
                 const next: Record<string, FolderState> = {};
                 Object.entries(normalizedFolders).forEach(([folderKey, count]) => {
+                    // Double-check deletion status
+                    if (isFolderDeletePending(folderKey)) return;
                     const existing = prev[folderKey];
                     next[folderKey] = existing
                         ? { ...existing, total: count, hasMore: count > existing.items.length }
@@ -213,11 +275,16 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
         } finally {
             setLoading(false);
         }
-    }, [settingsState?.relativePath, rootFolder]);
+    }, [settingsState?.relativePath, rootFolder, isFolderDeletePending]);
 
     const loadFolderPage = useCallback(async (folder: string, page = 0, replace = false) => {
         const normalizedFolder = normalizeFolderKey(folder || currentFolderRef.current || rootFolder);
         if (!normalizedFolder) {
+            return;
+        }
+        // Skip loading if this folder is pending deletion - prevents flicker from
+        // attempting to load data for a folder that's being removed
+        if (isFolderDeletePending(normalizedFolder)) {
             return;
         }
         let resolvedFolder = normalizedFolder;
@@ -289,17 +356,24 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
                 return next;
             });
         }
-    }, [settingsState?.relativePath, rootFolder]);
+    }, [settingsState?.relativePath, rootFolder, isFolderDeletePending]);
 
     const handleRealtimeChanges = useCallback((payload: any) => {
         if (!payload) return;
-        // Skip processing if we're actively favoriting (to prevent UI flicker)
-        if (suppressFileWatcherRef.current) return;
+
+        // Cleanup stale deleted folder entries on each real-time event
+        cleanupDeletedFoldersTracking();
+
         const totalsRaw = payload.totals ?? {};
         const normalizedTotals: Record<string, number> = {};
         Object.entries(totalsRaw).forEach(([key, value]) => {
             const normalizedKey = normalizeFolderKey(key);
             if (!normalizedKey) return;
+            // IMPORTANT: Skip folders that are in the deletion grace period
+            // This prevents deleted folders from being re-added by stale events
+            if (isFolderDeletePending(normalizedKey)) {
+                return;
+            }
             const numericValue = typeof value === 'number' ? value : Number(value ?? 0);
             normalizedTotals[normalizedKey] = Number.isFinite(numericValue) ? numericValue : 0;
         });
@@ -307,6 +381,8 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
             setFolderCounts(prev => {
                 const next = { ...prev };
                 Object.entries(normalizedTotals).forEach(([key, count]) => {
+                    // Double-check in case deletion happened between filtering and state update
+                    if (isFolderDeletePending(key)) return;
                     next[key] = count;
                 });
                 return next;
@@ -314,6 +390,8 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
             setFolderData(prev => {
                 const next: Record<string, FolderState> = { ...prev };
                 Object.entries(normalizedTotals).forEach(([key, count]) => {
+                    // Skip deleted folders
+                    if (isFolderDeletePending(key)) return;
                     const existing = next[key];
                     if (existing) {
                         next[key] = {
@@ -339,6 +417,9 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
 
             // Helper function to apply a change to a specific folder state
             const applyChangeToFolder = (targetFolderKey: string, change: any, incoming?: FileDetails) => {
+                // Skip if this folder is pending deletion
+                if (isFolderDeletePending(targetFolderKey)) return;
+
                 const existing = next[targetFolderKey] ?? createEmptyFolderState();
                 const pageSize = existing.pageSize || DEFAULT_PAGE_SIZE;
                 const loadedPages = existing.loadedPages ? [...existing.loadedPages] : [];
@@ -384,6 +465,9 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
                 const folderKey = normalizeFolderKey(change?.folder);
                 if (!folderKey) return;
 
+                // Skip changes for folders pending deletion
+                if (isFolderDeletePending(folderKey)) return;
+
                 let incoming: FileDetails | undefined;
                 if (change?.data) {
                     incoming = {
@@ -407,8 +491,9 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
         if (removedUrls.length) {
             removedUrls.forEach(invalidateMetadataCacheByUrl);
             setSelectedImages(prev => prev.filter(url => !removedUrls.includes(url)));
+            favoritesStore.removeUrls(removedUrls);
         }
-    }, [setFolderCounts, setFolderData, setSelectedImages, rootFolder]);
+    }, [setFolderCounts, setFolderData, setSelectedImages, rootFolder, isFolderDeletePending, cleanupDeletedFoldersTracking]);
 
     const loadMore = useCallback(async (folder?: string) => {
         const target = normalizeFolderKey(folder || currentFolderRef.current || rootFolder);
@@ -479,51 +564,269 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
         });
     }, [rootFolder]);
 
-    // Favorites functions
-    const isFavorite = useCallback((url: string) => {
-        return favorites.has(url) || url.includes('/_favorites/');
-    }, [favorites]);
+    // ========================================================================
+    // PROMPT INDEX BACKGROUND BUILDER
+    // Builds a lightweight index (url -> positive prompt) for fast prompt search
+    // without mutating folderData, to avoid flicker and heavy re-renders.
+    // ========================================================================
+    const prefetchAbortRef = useRef<AbortController | null>(null);
+    const prefetchedUrlsRef = useRef<Set<string>>(new Set());
 
-    const toggleFavorite = useCallback(async (image: FileDetails) => {
-        try {
-            // Suppress file watcher events to prevent UI flicker during favorite operation
-            suppressFileWatcherRef.current = true;
+    const buildPromptIndexBatch = useCallback(
+        async (getItems: () => FileDetails[], signal: AbortSignal) => {
+            const BATCH_SIZE = 6;
+            const BATCH_DELAY = 150;
+            const MAX_PREFETCH = 200;
 
-            const result = await ComfyAppApi.toggleFavorite(image.url);
-            if (result.success) {
-                // Just update the favorites set - no UI refresh
-                setFavorites(prev => {
-                    const next = new Set(prev);
-                    if (result.isFavorite && result.newPath) {
-                        next.add(result.newPath);
-                        next.delete(image.url);
-                    } else {
-                        next.delete(image.url);
-                        if (result.newPath) {
-                            next.delete(result.newPath);
+            const items = getItems();
+            const needsFetch = items
+                .filter(item => {
+                    if (item.type !== 'image') return false;
+                    if (prefetchedUrlsRef.current.has(item.url)) return false;
+
+                    // If we already have an indexed prompt, no need to fetch
+                    if (promptIndexRef.current.has(item.url)) return false;
+
+                    // If we already have full metadata attached (e.g. from info panel),
+                    // we can index from it locally without a network call.
+                    if (item.metadata && !item.metadata_pending) return false;
+
+                    return true;
+                })
+                .slice(0, MAX_PREFETCH);
+
+            if (!needsFetch.length) return;
+
+            let anyIndexed = false;
+
+            for (let i = 0; i < needsFetch.length; i += BATCH_SIZE) {
+                if (signal.aborted) break;
+
+                const batch = needsFetch.slice(i, i + BATCH_SIZE);
+
+                await Promise.allSettled(
+                    batch.map(async (item) => {
+                        if (signal.aborted) return;
+                        if (prefetchedUrlsRef.current.has(item.url)) return;
+
+                        try {
+                            prefetchedUrlsRef.current.add(item.url);
+                            const response = await ComfyAppApi.fetchMetadata(item.url);
+                            if (!response.ok || signal.aborted) return;
+
+                            const payload = await response.json();
+                            if (signal.aborted) return;
+
+                            const parsed = parseComfyMetadata(payload.metadata ?? null);
+                            const positive = (parsed['Positive Prompt'] || '').toLowerCase();
+                            if (positive) {
+                                promptIndexRef.current.set(item.url, positive);
+                            }
+                        } catch {
+                            // Silently ignore; we'll keep existing index entries
                         }
-                    }
-                    return next;
-                });
+                    })
+                );
+
+                if (signal.aborted) break;
+                if (i + BATCH_SIZE < needsFetch.length) {
+                    await new Promise(resolve => setTimeout(resolve, BATCH_DELAY));
+                }
             }
+            // Note: No state update here - index lives in ref
+            // Results will appear on next user keystroke/filter change
+        },
+        []
+    );
 
-            // Re-enable file watcher after a delay to let any pending events pass
-            setTimeout(() => {
-                suppressFileWatcherRef.current = false;
-            }, 2000);
-        } catch (error) {
-            console.error('Error toggling favorite:', error);
-            suppressFileWatcherRef.current = false;
-        }
-    }, []);
-
-    // Load favorites on mount
+    // Kick off prompt indexing when user starts searching by prompt
     useEffect(() => {
-        (async () => {
-            const favList = await ComfyAppApi.fetchFavorites();
-            setFavorites(new Set(favList));
-        })();
-    }, []);
+        const normalized = normalizeFolderKey(currentFolder);
+        const query = searchFileName.trim();
+        if (!normalized || !query || searchMode !== 'prompt') return;
+
+        // Cancel any existing background work
+        if (prefetchAbortRef.current) {
+            prefetchAbortRef.current.abort();
+        }
+
+        const controller = new AbortController();
+        prefetchAbortRef.current = controller;
+
+        const getItems = () => folderDataRef.current[normalized]?.items ?? [];
+        buildPromptIndexBatch(getItems, controller.signal).catch(() => {});
+
+        return () => {
+            controller.abort();
+        };
+    }, [currentFolder, searchFileName, searchMode, buildPromptIndexBatch]);
+
+    // Clear prompt index when root changes (essentially a new gallery session)
+    useEffect(() => {
+        promptIndexRef.current.clear();
+        prefetchedUrlsRef.current.clear();
+    }, [rootFolder]);
+    // ========================================================================
+
+    // Optimistically remove a set of image URLs from all folders to keep the UI snappy.
+    // The filesystem monitor will later reconcile any discrepancies from the backend.
+    const optimisticRemoveByUrls = useCallback((urls: string[]) => {
+        if (!urls.length) return;
+        const urlSet = new Set(urls);
+        const removedPerFolder: Record<string, number> = {};
+        const removedUrls: string[] = [];
+
+        setFolderData(prev => {
+            const next: Record<string, FolderState> = {};
+
+            Object.entries(prev).forEach(([folderKey, state]) => {
+                const originalItems = state.items ?? [];
+                let removedCountForFolder = 0;
+
+                const items = originalItems.filter(item => {
+                    if (urlSet.has(item.url)) {
+                        removedCountForFolder += 1;
+                        if (!removedUrls.includes(item.url)) {
+                            removedUrls.push(item.url);
+                        }
+                        return false;
+                    }
+                    return true;
+                });
+
+                if (removedCountForFolder > 0) {
+                    removedPerFolder[folderKey] = (removedPerFolder[folderKey] ?? 0) + removedCountForFolder;
+                    const previousTotal = Number.isFinite(state.total) ? state.total : originalItems.length;
+                    const total = Math.max(0, previousTotal - removedCountForFolder);
+                    next[folderKey] = {
+                        ...state,
+                        items,
+                        total,
+                        hasMore: total > items.length,
+                    };
+                } else {
+                    next[folderKey] = state;
+                }
+            });
+
+            return next;
+        });
+
+        setFolderCounts(prev => {
+            if (!Object.keys(removedPerFolder).length) return prev;
+            const next = { ...prev };
+            Object.entries(removedPerFolder).forEach(([folderKey, removed]) => {
+                const before = typeof next[folderKey] === 'number' ? next[folderKey] : 0;
+                next[folderKey] = Math.max(0, before - removed);
+            });
+            return next;
+        });
+
+        if (removedUrls.length) {
+            setSelectedImages(prev => prev.filter(url => !urlSet.has(url)));
+            removedUrls.forEach(invalidateMetadataCacheByUrl);
+            favoritesStore.removeUrls(removedUrls);
+        }
+    }, [setFolderData, setFolderCounts, setSelectedImages]);
+
+    // High-level delete API used by the UI: perform an optimistic removal and then
+    // dispatch delete requests to the backend. Any mismatches will be corrected
+    // by the realtime file-change events feeding back into the context.
+    const deleteImages = useCallback(async (urls: string[]) => {
+        if (!urls || !urls.length) return;
+
+        // Optimistic update for instant UX
+        optimisticRemoveByUrls(urls);
+
+        // Fire-and-forget deletes; we don't block the UI on these.
+        await Promise.allSettled(
+            urls.map(async (url) => {
+                try {
+                    await ComfyAppApi.deleteImage(url);
+                } catch (err) {
+                    console.error('Failed to delete image:', url, err);
+                }
+            })
+        );
+    }, [optimisticRemoveByUrls]);
+
+    // High-level folder delete: call backend, then prune the folder subtree from
+    // local state (folderCounts + folderData) and redirect currentFolder if needed.
+    const deleteFolder = useCallback(async (folderKey: string) => {
+        const normalizedKey = normalizeFolderKey(folderKey);
+        if (!normalizedKey) return;
+
+        // IMPORTANT: Mark folder as deleted IMMEDIATELY, before any async operations.
+        // This prevents real-time events from re-adding the folder while deletion is in progress.
+        const deletionTimestamp = Date.now();
+        deletedFoldersRef.current.set(normalizedKey, deletionTimestamp);
+
+        // Also mark all subfolders as deleted (they'll be removed with parent)
+        Object.keys(folderData).forEach(key => {
+            const normKey = normalizeFolderKey(key);
+            if (normKey.startsWith(normalizedKey + '/')) {
+                deletedFoldersRef.current.set(normKey, deletionTimestamp);
+        }
+        });
+
+        // Optimistically prune from UI immediately (before backend responds)
+        // This gives instant feedback and prevents flicker
+        setFolderData(prev => {
+            const next: Record<string, FolderState> = {};
+            Object.entries(prev).forEach(([key, state]) => {
+                const normKey = normalizeFolderKey(key);
+                if (normKey === normalizedKey || normKey.startsWith(normalizedKey + "/")) {
+                    return; // Drop this folder subtree
+                }
+                next[key] = state;
+            });
+            return next;
+        });
+
+        setFolderCounts(prev => {
+            const next: Record<string, number> = {};
+            Object.entries(prev).forEach(([key, count]) => {
+                const normKey = normalizeFolderKey(key);
+                if (normKey === normalizedKey || normKey.startsWith(normalizedKey + "/")) {
+                    return;
+                }
+                next[key] = count;
+            });
+            return next;
+        });
+
+        // If the current folder is inside the deleted subtree, bounce back to root
+        setCurrentFolder(prev => {
+            const currentNorm = normalizeFolderKey(prev || currentFolderRef.current || "");
+            if (!currentNorm) return prev;
+            if (currentNorm === normalizedKey || currentNorm.startsWith(normalizedKey + "/")) {
+                const fallback = rootFolder ? normalizeFolderKey(rootFolder) : "";
+                return fallback || "";
+            }
+            return prev;
+        });
+
+        // Now call backend (UI is already updated)
+        try {
+            const ok = await ComfyAppApi.deleteFolder(normalizedKey);
+            if (!ok) {
+                console.error('Failed to delete folder:', normalizedKey);
+                // Note: We don't restore the folder on failure - the grace period will expire
+                // and a refresh will restore it if it still exists on disk
+            }
+        } catch (err) {
+            console.error('Error deleting folder:', normalizedKey, err);
+        }
+
+        // Refresh folder list to ensure counts are accurate
+        // The grace period protects against race conditions during this refresh
+        try {
+            await loadFolderList();
+        } catch (err) {
+            console.error('Error refreshing folder list after delete:', err);
+        }
+    }, [rootFolder, setCurrentFolder, setFolderCounts, setFolderData, loadFolderList, folderData]);
+
 
     useAsyncEffect(async () => {
         try {
@@ -576,6 +879,10 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
                 const target = normalizeFolderKey(currentFolderRef.current || root);
                 setCurrentFolder(prev => prev || target);
                 await loadFolderPage(target || root || effectiveSettings.relativePath, 0, true);
+                await favoritesStore.initialize();
+                // Compute favorites folder key using fresh root value to avoid stale closure
+                const freshFavoritesKey = root ? `${root}/${FAVORITES_FOLDER}` : FAVORITES_FOLDER;
+                setFolderCounts(prev => ({ ...prev, [freshFavoritesKey]: favoritesStore.getCount() }));
             } catch (err) {
                 if (!cancelled) {
                     setError(err);
@@ -598,13 +905,15 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
     useEffect(() => {
         const target = normalizeFolderKey(currentFolder);
         if (!target) return;
+        // Don't try to load a folder that's pending deletion
+        if (isFolderDeletePending(target)) return;
         const state = folderData[target];
         const isLoaded = state && state.loadedPages.length > 0;
         const isLoading = !!loadingFolders[target];
         if (!isLoaded && !isLoading) {
             loadFolderPage(target, 0, true).catch(() => {});
         }
-    }, [currentFolder, folderData, loadingFolders, loadFolderPage]);
+    }, [currentFolder, folderData, loadingFolders, loadFolderPage, isFolderDeletePending]);
 
     useEffect(() => {
         if (!currentFolder && rootFolder) {
@@ -618,29 +927,100 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
     // Derive showDateDivider from settings
     const showDateDivider = settingsState?.showDateDivider ?? DEFAULT_SETTINGS.showDateDivider;
 
-    const imagesDetailsList = useMemo(() => {
-        let list: FileDetails[] = [...(currentFolderState.items ?? [])];
-        if (searchFileName && searchFileName.trim() !== "") {
-            const searchTerm = searchFileName.toLowerCase();
-            list = list.filter(imageInfo => imageInfo.name.toLowerCase().includes(searchTerm));
+    // Memoize filtered URLs separately - this is the expensive filtering operation
+    const filteredUrls = useMemo(() => {
+        const items = currentFolderState.items ?? [];
+        const searchTrimmed = searchFileName.trim().toLowerCase();
+
+        if (!searchTrimmed) {
+            // No search - return all media item URLs in order
+            return items
+                .filter(item => item.type === 'image' || item.type === 'media' || item.type === 'audio')
+                .map(item => item.url);
         }
+
+        if (searchMode === 'filename') {
+            // Simple filename search
+            return items
+                .filter(item => {
+                    if (item.type !== 'image' && item.type !== 'media' && item.type !== 'audio') return false;
+                    return (item.name || '').toLowerCase().includes(searchTrimmed);
+                })
+                .map(item => item.url);
+        }
+
+        // Prompt search with comma-separated term support
+        const terms = searchTrimmed.split(',').map(t => t.trim()).filter(Boolean);
+
+        return items
+            .filter(item => {
+                if (item.type !== 'image' && item.type !== 'media' && item.type !== 'audio') return false;
+
+                // 1. Look up from prompt index (fast path - reads from ref)
+                let positivePrompt = promptIndexRef.current.get(item.url) || '';
+
+                // 2. If not indexed but we already have metadata, derive once locally
+                if (!positivePrompt && item.metadata && !item.metadata_pending) {
+                    const parsed = parseComfyMetadata(item.metadata as any);
+                    positivePrompt = (parsed['Positive Prompt'] || '').toLowerCase();
+                    if (positivePrompt) {
+                        promptIndexRef.current.set(item.url, positivePrompt);
+                    }
+                }
+
+                const fallbackName = (item.name || '').toLowerCase();
+                const haystack = positivePrompt || fallbackName;
+                if (!haystack) return false;
+
+                if (terms.length === 0) {
+                    return haystack.includes(searchTrimmed);
+                }
+                return terms.every(term => haystack.includes(term));
+            })
+            .map(item => item.url);
+    }, [currentFolderState.items, searchFileName, searchMode]);
+
+    // Build the display list only when filtered URLs actually change
+    // This prevents re-renders when typing produces the same results
+    const imagesDetailsList = useMemo(() => {
+        const items = currentFolderState.items ?? [];
+        const searchTrimmed = searchFileName.trim();
+
+        // Build URL set for O(1) lookup
+        const filteredUrlSet = new Set(filteredUrls);
+
+        // Get filtered items maintaining original order
+        let list: FileDetails[];
+        if (!searchTrimmed) {
+            // No search - use all items
+            list = [...items];
+        } else {
+            // Filter to only items matching search
+            list = items.filter(item => filteredUrlSet.has(item.url));
+        }
+
+        // Apply sorting
         if (sortMethod !== 'Name ↑' && sortMethod !== 'Name ↓') {
             list = list.sort((a, b) => (sortMethod === 'Newest' ? (b.timestamp || 0) - (a.timestamp || 0) : (a.timestamp || 0) - (b.timestamp || 0)));
+
             if (!showDateDivider) return list;
+
+            // Group by date with dividers
             const grouped: { [date: string]: FileDetails[] } = {};
             list.forEach(item => {
                 const date = item.timestamp ? new Date(item.timestamp * 1000).toISOString().slice(0, 10) : 'Unknown';
                 if (!grouped[date]) grouped[date] = [];
                 grouped[date].push(item);
             });
+
             const result: FileDetails[] = [];
-            Object.entries(grouped).forEach(([date, items]) => {
+            Object.entries(grouped).forEach(([date, dateItems]) => {
                 const colCount = Math.max(1, gridSize.columnCount || 1);
                 for (let i = 0; i < colCount; i++) {
                     result.push({ name: date, type: 'divider', url: '', timestamp: 0, date, metadata: null, folder: normalizedCurrentFolder, metadata_pending: false });
                 }
-                result.push(...items);
-                const remainder = items.length % colCount;
+                result.push(...dateItems);
+                const remainder = dateItems.length % colCount;
                 if (remainder !== 0 && colCount > 1) {
                     for (let i = 0; i < colCount - remainder; i++) {
                         result.push({ name: `empty-${date}-${i}`, type: 'empty-space', url: '', timestamp: 0, date, metadata: null, folder: normalizedCurrentFolder, metadata_pending: false });
@@ -649,6 +1029,7 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
             });
             return result;
         }
+
         switch (sortMethod) {
             case 'Name ↑':
                 return list.sort((a, b) => a.name.localeCompare(b.name));
@@ -657,7 +1038,7 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
             default:
                 return list;
         }
-    }, [currentFolderState.items, searchFileName, sortMethod, settingsState?.showDateDivider, gridSize.columnCount, normalizedCurrentFolder]);
+    }, [filteredUrls, currentFolderState.items, sortMethod, showDateDivider, gridSize.columnCount, normalizedCurrentFolder, searchFileName]);
 
     const imagesUrlsLists = useMemo(() =>
         imagesDetailsList
@@ -728,6 +1109,8 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
         error,
         searchFileName,
         setSearchFileName,
+        searchMode,
+        setSearchMode,
         showDateDivider,
         showSettings,
         setShowSettings,
@@ -759,9 +1142,10 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
         siderCollapsed,
         setSiderCollapsed,
         updateFileMetadata,
-        favorites,
-        isFavorite,
-        toggleFavorite,
+        lastSelectedIndex,
+        setLastSelectedIndex,
+        deleteImages,
+        deleteFolder,
     }), [
         currentFolder,
         setCurrentFolder,
@@ -775,6 +1159,7 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
         combinedLoading,
         error,
         searchFileName,
+        searchMode,
         showDateDivider,
         showSettings,
         showRawMetadata,
@@ -795,9 +1180,10 @@ export function GalleryProvider({ children }: { children: React.ReactNode }) {
         selectedImages,
         siderCollapsed,
         updateFileMetadata,
-        favorites,
-        isFavorite,
-        toggleFavorite,
+        lastSelectedIndex,
+        setLastSelectedIndex,
+        deleteImages,
+        deleteFolder,
     ]);
 
     return <GalleryContext.Provider value={value}>{children}</GalleryContext.Provider>;

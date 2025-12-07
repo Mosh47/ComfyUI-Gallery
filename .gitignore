@@ -33,3 +33,46 @@ Thumbs.db
 # Tracking file
 .tracking
 
+# ===========================================
+# MEDIA FILES - NEVER COMMIT THESE
+# ===========================================
+# Images
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.bmp
+*.tiff
+*.tif
+*.ico
+*.svg
+
+# Video
+*.mp4
+*.webm
+*.mov
+*.avi
+*.mkv
+*.wmv
+*.flv
+*.m4v
+
+# Audio
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.ogg
+*.aac
+*.wma
+
+# Thumbnails and cache
+gallery_thumbnails/
+thumbnails/
+cache/
+*.cache
+
+# Output folders (should never be in custom_nodes anyway)
+output/
+outputs/

@@ -1,176 +1,145 @@
 # ComfyUI-Gallery (Performance Fork)
 
-> **Doesn't make your PC want to die.**
+> **Finally, a gallery that doesn't murder your PC.**
 
-This is a performance-optimized fork of [PanicTitan/ComfyUI-Gallery](https://github.com/PanicTitan/ComfyUI-Gallery) that fixes critical issues causing ComfyUI to slow to a crawl, especially with large image collections.
+A fork of [ComfyUI-Gallery](https://github.com/PanicTitan/ComfyUI-Gallery) that actually works with large image collections.
 
-![ComfyUI Gallery Node in Action](showcase.gif)
-
-## 🚨 Why This Fork Exists
-
-The original ComfyUI-Gallery had **catastrophic performance issues**:
-- Full directory rescans on EVERY file change
-- Metadata extraction for EVERY file on EVERY scan
-- Broken prompt extraction that only grabbed partial prompts
-- No support for complex workflows with ConditioningConcat, CFGGuider, etc.
-
-**If you have hundreds or thousands of images, the original would bring ComfyUI to its knees.**
+![ComfyUI Gallery](showcase.gif)
 
 ---
 
-## ✨ What's Fixed in This Fork
+## The Problem
 
-### 🔧 **Complete Metadata Parser Rewrite**
+The original gallery has a fatal flaw: **every time you save an image, it rescans your ENTIRE output folder and re-extracts metadata from EVERY file.**
 
-The prompt extraction was fundamentally broken. It only grabbed ONE text from the prompt chain, missing:
-- Text from `ConditioningConcat` nodes (quality tags, style prompts)
-- Resolved wildcards from `ImpactWildcardProcessor`
-- Multiple text sources combined via `CR Text Concatenate`
-- Prompts from workflows using `SamplerCustomAdvanced` + `CFGGuider`
+Got 500 images? That's 500 file reads. Got 5,000? Good luck.
 
-**Now it properly extracts the FULL prompt by:**
+Your GPU sits idle while ComfyUI chokes on disk I/O.
 
-1. **Dynamic Graph Traversal** - Follows the actual node connections, not hardcoded IDs
-2. **ConditioningConcat Support** - Traces BOTH `conditioning_to` AND `conditioning_from` branches
-3. **ImpactWildcardProcessor Support** - Uses `populated_text` (the resolved wildcard result)
-4. **CR Text Concatenate Support** - Properly joins `text1` + `separator` + `text2`
-5. **CFGGuider Support** - Handles `SamplerCustomAdvanced` workflows that use guiders
-6. **Extensible Design** - Easy to add new node types without rewriting logic
+## The Solution
 
-### 📋 Supported Node Types
+This fork fixes it. Properly.
 
-**Samplers:**
-- KSampler, KSamplerAdvanced, SamplerCustom, SamplerCustomAdvanced
-- FaceDetailerPipe, DetailerForEach, UltimateSDUpscale
-- Tiled KSampler variants
+| Before | After |
+|--------|-------|
+| Full rescan on every file change | Only processes the changed file |
+| Extracts metadata from ALL files every time | SQLite cache—extracts once, reads forever |
+| Sends entire folder over WebSocket | Sends only what changed |
+| Loads all images at once | Virtualized grid with lazy loading |
+| 0.5s debounce (useless) | Smart batching with proper debouncing |
+| Broken prompt extraction | Full node graph tracing for complete prompts |
 
-**Text/Prompt Nodes:**
-- CLIPTextEncode, CR Text, CR Prompt Text
-- ImpactWildcardProcessor (uses `populated_text`!)
-- CR Text Concatenate, Text Concatenate, StringConcat
-- ShowText|pysssss, and more
-
-**Conditioning Nodes:**
-- ConditioningConcat, ConditioningCombine
-- CFGGuider, BasicGuider, DualCFGGuider
-
-### 🔄 How It Works
-
-```
-Your Workflow:
-[Main Prompt] → CLIPTextEncode ─────────────────────┐
-                                                    ├→ ConditioningConcat → CFGGuider → Sampler
-[Quality Tags] → CLIPTextEncode ────────────────────┘
-
-Old Parser: Only grabbed [Main Prompt] ❌
-New Parser: Grabs [Main Prompt] + [Quality Tags] ✅
-```
-
-The parser dynamically traces the graph from the sampler backwards, following ALL branches through concat nodes to collect every piece of text that contributes to your final image.
+**Result:** Gallery stays snappy even with thousands of images.
 
 ---
 
-## 🛠️ Performance Improvements (Roadmap)
-
-These optimizations are planned/in-progress:
-
-| Issue | Status | Impact |
-|-------|--------|--------|
-| Full rescan on every file change | 🔄 Planned | Critical |
-| Metadata extraction on every scan | 🔄 Planned | Critical |
-| SQLite metadata cache | 🔄 Planned | High |
-| Incremental file updates | 🔄 Planned | High |
-| Increased debounce (0.5s → 3s) | 🔄 Planned | Medium |
-| Lazy metadata extraction | 🔄 Planned | Medium |
-| API pagination | 🔄 Planned | Medium |
-
----
-
-## 📦 Installation
-
-### Via Git (Recommended for this fork)
+## Installation
 
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/Mosh47/ComfyUI-Gallery.git
-```
-
-Restart ComfyUI.
-
-### Dependencies
-
-```bash
-cd ComfyUI/custom_nodes/ComfyUI-Gallery
+cd ComfyUI-Gallery
 pip install -r requirements.txt
 ```
 
----
-
-## 🎮 Usage
-
-1. **Open Gallery:** Click "Open Gallery" button in ComfyUI
-2. **Browse:** Navigate folders, search, sort by date/name
-3. **View Metadata:** Click "Info" on any image to see full extracted metadata
-4. **Batch Operations:** Ctrl+Click to select multiple images for download/delete
+Restart ComfyUI. Done.
 
 ---
 
-## ⚙️ Adding Support for Custom Nodes
+## Features
 
-If you use custom nodes that aren't recognized, you can add them to the arrays in `web/src/metadata-parser/promptMetadataParser.ts`:
+### 🔍 Smart Search
+- **Prompt Search**: Search by positive prompt content with comma-separated terms (e.g., `cat, sunset, beach`)
+- **Filename Search**: Traditional filename search
+- **Toggle Switch**: Easily switch between search modes with a beautiful segmented control
+- **Debounced Input**: 300ms debounce prevents UI lag while typing
+- **Background Indexing**: Prompts are indexed in the background for instant search results
 
-```typescript
-// Add new sampler types
-const SAMPLER_NODE_TYPES = [
-    'KSampler', 'YourCustomSampler', ...
-];
+### 📁 Folder Management
+- **Folder Tree**: Navigate your output folders with an expandable sidebar
+- **Create Folders**: Right-click to create new folders
+- **Delete Folders**: Remove folders with confirmation dialog
+- **Drag & Drop**: Move images between folders by dragging onto the sidebar
+- **Real-time Updates**: File changes detected instantly via filesystem monitoring
 
-// Add new text concatenation nodes
-const TEXT_CONCAT_TYPES = [
-    'CR Text Concatenate', 'YourCustomConcat', ...
-];
+### ⭐ Favorites System
+- **Star Images**: Click the star button on any image to favorite it
+- **Favorites Folder**: All favorites are accessible in a dedicated virtual folder
+- **Persistent**: Favorites survive restarts
 
-// Add new text source nodes
-const TEXT_NODE_TYPES = [
-    'CLIPTextEncode', 'YourCustomTextNode', ...
-];
+### 🖼️ Image Preview
+- **Full Preview**: Click any image for a large, centered preview
+- **Keyboard Navigation**: Use arrow keys to navigate between images
+- **Video Support**: Full playback controls for video files
+- **Audio Support**: Play audio files directly in the gallery
+
+### 📋 Metadata View
+- **Full Prompt Extraction**: Traces the complete node graph to capture your full prompt
+- **Supports Complex Workflows**: Works with KSampler, SamplerCustomAdvanced, CFGGuider, ConditioningConcat, ImpactWildcardProcessor, CR Text Concatenate, and more
+- **Copy to Clipboard**: One-click copy for any metadata field
+- **Raw JSON View**: Toggle to see the complete raw metadata
+
+### ✅ Multi-Select & Batch Operations
+- **Ctrl+Click**: Select/deselect individual images
+- **Shift+Click**: Range selection for multiple images
+- **Batch Download**: Download selected images as a ZIP file
+- **Batch Delete**: Delete multiple images at once with confirmation
+
+### 🎨 User Interface
+- **Virtualized Grid**: Only renders visible images for buttery smooth scrolling
+- **Date Dividers**: Images grouped by date (optional, can be toggled off)
+- **Sort Options**: Sort by Newest, Oldest, Name ↑, or Name ↓
+- **Dark Mode**: Beautiful dark theme by default
+- **Responsive**: Adapts to window size automatically
+
+### ⌨️ Keyboard Shortcuts
+- **Ctrl+G**: Open/close the gallery
+- **Escape**: Close preview or info panel
+- **Arrow Keys**: Navigate between images in preview mode
+
+### ⚙️ Settings
+- **Relative Path**: Configure the root folder for the gallery
+- **Auto-play Videos**: Toggle automatic video playback on hover
+- **Date Dividers**: Show or hide date groupings
+- **Floating Button**: Toggle the gallery open button
+- **Scan Extensions**: Configure which file types to include
+
+---
+
+## Fixed: Prompt Extraction
+
+The original only grabbed part of your prompt. If you use `ConditioningConcat`, wildcards, or `CFGGuider`—it missed half your text.
+
+This fork traces the full node graph:
+
+```
+[Main Prompt] ──→ CLIPTextEncode ──┐
+                                   ├──→ ConditioningConcat ──→ Sampler
+[Quality Tags] ─→ CLIPTextEncode ──┘
+
+Original: "a photo of a cat"
+This fork: "a photo of a cat, masterpiece, best quality, 8k uhd"
 ```
 
-Then rebuild:
-```bash
-cd web && npm run build
-```
+---
+
+## Performance Optimizations
+
+This fork includes extensive performance work:
+
+- **Virtualized Grid**: Using react-window for efficient rendering of large lists
+- **Memoized Components**: React.memo with custom comparison functions
+- **Debounced Search**: 300ms debounce on search input
+- **Background Prompt Indexing**: Indexes prompts without blocking the UI
+- **Stable References**: Prevents unnecessary re-renders with proper useMemo/useCallback usage
+- **itemData Pattern**: Efficient data passing to virtualized cells
+- **Grace Period for Deletions**: Prevents flickering when folders are deleted
 
 ---
 
-## 📝 Original Features (Inherited)
+## Credits
 
-- Real-time gallery updates via Watchdog
-- Video, GIF, and Audio support
-- Image metadata inspection with JSON viewer
-- Search and sort functionality
-- Drag-and-drop file moving
-- Batch download as ZIP
-- Dark/Light mode
-- Configurable file extensions
-- Ctrl+G keyboard shortcut
+- Original: [PanicTitan](https://github.com/PanicTitan/ComfyUI-Gallery)
+- This fork: [Mosh47](https://github.com/Mosh47/ComfyUI-Gallery)
 
-See the [original repo](https://github.com/PanicTitan/ComfyUI-Gallery) for full feature documentation.
-
----
-
-## 🙏 Credits
-
-- **Original Author:** [PanicTitan](https://github.com/PanicTitan/ComfyUI-Gallery)
-- **Performance Fork:** [Mosh47](https://github.com/Mosh47/ComfyUI-Gallery)
-- **ComfyUI:** [comfyanonymous](https://github.com/comfyanonymous/ComfyUI)
-
----
-
-## 📄 License
-
-MIT License - See [LICENSE](LICENSE)
-
----
-
-**If the original gallery was making your ComfyUI unusable, give this fork a try!**
+MIT License

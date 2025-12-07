@@ -11,7 +11,7 @@ import threading
 import queue
 import asyncio
 import shutil
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from urllib.parse import unquote
 
 from .folder_monitor import FileSystemMonitor
@@ -199,6 +199,9 @@ async def get_gallery_list(request):
                     _normalize_folder_key_value(folder): {"count": len(files)}
                     for folder, files in folders_with_metadata.items()
                 }
+                favorites_key = _favorites_folder_key(normalized_root)
+                favorites_count = len(_load_existing_favorites(_get_static_directory()))
+                summary[favorites_key] = {"count": favorites_count}
                 summary.setdefault(
                     normalized_root,
                     {
@@ -235,11 +238,18 @@ async def get_gallery_images_paginated(request):
     folder_query = request.rel_url.query.get("folder")
     target_folder = _normalize_folder_key_value(folder_query) if folder_query else normalized_root
 
-    target_path = _folder_key_to_path(root_path, normalized_root, target_folder)
-    if target_path is None:
-        return web.Response(status=400, text="Invalid folder path.")
-    if not os.path.isdir(target_path):
-        return web.Response(status=404, text="Folder not found.")
+    favorites_key = _favorites_folder_key(normalized_root)
+    is_favorites_folder = target_folder in (FAVORITES_FOLDER_NAME, favorites_key)
+    if is_favorites_folder:
+        target_folder = favorites_key
+
+    target_path = None
+    if not is_favorites_folder:
+        target_path = _folder_key_to_path(root_path, normalized_root, target_folder)
+        if target_path is None:
+            return web.Response(status=400, text="Invalid folder path.")
+        if not os.path.isdir(target_path):
+            return web.Response(status=404, text="Folder not found.")
 
     sort_field = request.rel_url.query.get("sort", "timestamp").lower()
     if sort_field not in ("timestamp", "name"):
@@ -262,31 +272,34 @@ async def get_gallery_images_paginated(request):
     def thread_target():
         with PromptServer.instance.scan_lock:
             try:
-                entries = []
-
-                if recursive:
-                    # Recursively scan all subdirectories
-                    for dirpath, dirnames, filenames in os.walk(target_path):
-                        for filename in filenames:
-                            filepath = os.path.join(dirpath, filename)
-                            record = build_file_entry(root_path, root_key, filepath, scan_extensions)
-                            if not record:
-                                continue
-                            _, _, details = record
-                            details["folder"] = _normalize_folder_key_value(details.get("folder") or target_folder)
-                            entries.append(details)
+                if is_favorites_folder:
+                    entries = _build_favorite_entries(normalized_root, scan_extensions)
                 else:
-                    # Non-recursive scan (original behavior)
-                    with os.scandir(target_path) as iterator:
-                        for entry in iterator:
-                            if not entry.is_file():
-                                continue
-                            record = build_file_entry(root_path, root_key, entry.path, scan_extensions)
-                            if not record:
-                                continue
-                            _, _, details = record
-                            details["folder"] = _normalize_folder_key_value(details.get("folder") or target_folder)
-                            entries.append(details)
+                    entries = []
+
+                    if recursive:
+                        # Recursively scan all subdirectories
+                        for dirpath, dirnames, filenames in os.walk(target_path):
+                            for filename in filenames:
+                                filepath = os.path.join(dirpath, filename)
+                                record = build_file_entry(root_path, root_key, filepath, scan_extensions)
+                                if not record:
+                                    continue
+                                _, _, details = record
+                                details["folder"] = _normalize_folder_key_value(details.get("folder") or target_folder)
+                                entries.append(details)
+                    else:
+                        # Non-recursive scan (original behavior)
+                        with os.scandir(target_path) as iterator:
+                            for entry in iterator:
+                                if not entry.is_file():
+                                    continue
+                                record = build_file_entry(root_path, root_key, entry.path, scan_extensions)
+                                if not record:
+                                    continue
+                                _, _, details = record
+                                details["folder"] = _normalize_folder_key_value(details.get("folder") or target_folder)
+                                entries.append(details)
 
                 if sort_field == "name":
                     entries.sort(key=lambda item: str(item.get("name", "")).lower(), reverse=descending)
@@ -598,35 +611,183 @@ async def move_image(request):
         return web.Response(status=500, text=str(e))
 
 
-# Favorites functionality
+# Favorites functionality - metadata based (no file moving)
 FAVORITES_FOLDER_NAME = "_favorites"
+FAVORITES_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "favorites.json")
+_favorites_lock = threading.Lock()
 
-def _get_favorites_folder():
-    """Get the favorites folder path, creating it if it doesn't exist."""
+def _favorites_folder_key(normalized_root: str) -> str:
+    """Consistent key used by the frontend for the virtual favorites folder."""
+    return f"{normalized_root}/{FAVORITES_FOLDER_NAME}" if normalized_root else FAVORITES_FOLDER_NAME
+
+def _normalize_favorite_url(image_url: str) -> Optional[str]:
+    """Ensure favorite entries always use /static_gallery/ prefixed URLs."""
+    if not image_url:
+        return None
+    url = str(image_url).replace("\\", "/")
+    if url.startswith("static_gallery/"):
+        url = "/" + url
+    if not url.startswith("/static_gallery/"):
+        return None
+    return url
+
+def _load_favorites_list() -> List[str]:
+    """Load raw favorites list from disk (may include stale entries)."""
+    with _favorites_lock:
+        if not os.path.exists(FAVORITES_DATA_FILE):
+            return []
+        try:
+            with open(FAVORITES_DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+                favorites = data.get("favorites") or []
+                return [str(item) for item in favorites if item]
+        except Exception:
+            return []
+
+def _save_favorites_list(urls: List[str]) -> None:
+    """Persist favorites list to disk."""
+    with _favorites_lock:
+        os.makedirs(os.path.dirname(FAVORITES_DATA_FILE), exist_ok=True)
+        try:
+            with open(FAVORITES_DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump({"favorites": urls}, f, indent=2)
+        except Exception as exc:
+            gallery_log(f"Error saving favorites list: {exc}")
+
+def _load_existing_favorites(static_dir: str) -> List[str]:
+    """Load favorites and prune entries that no longer exist on disk."""
+    raw_urls = _load_favorites_list()
+    cleaned: List[str] = []
+    changed = False
+    for url in raw_urls:
+        normalized = _normalize_favorite_url(url)
+        if not normalized:
+            changed = True
+            continue
+        full_path = _resolve_static_file(normalized)
+        if full_path and os.path.isfile(full_path):
+            cleaned.append(normalized)
+        else:
+            changed = True
+    if changed:
+        _save_favorites_list(cleaned)
+    return cleaned
+
+def _build_favorite_entries(normalized_root: str, scan_extensions) -> List[dict]:
+    """Convert favorite URLs into FileDetails entries for the virtual folder."""
     static_dir = _get_static_directory()
-    favorites_path = os.path.join(static_dir, FAVORITES_FOLDER_NAME)
-    if not os.path.exists(favorites_path):
-        os.makedirs(favorites_path, exist_ok=True)
-    return favorites_path
+    entries: List[dict] = []
+    favorites = _load_existing_favorites(static_dir)
+    favorites_folder_key = _favorites_folder_key(normalized_root)
 
-def _is_in_favorites(file_path: str) -> bool:
-    """Check if a file is in the favorites folder."""
-    favorites_folder = _get_favorites_folder()
-    real_file = os.path.realpath(file_path)
-    real_favorites = os.path.realpath(favorites_folder)
-    return real_file.startswith(real_favorites + os.sep)
+    for fav_url in favorites:
+        full_path = _resolve_static_file(fav_url)
+        if not full_path:
+            continue
+        record = build_file_entry(static_dir, normalized_root, full_path, scan_extensions)
+        if not record:
+            continue
+        _, _, details = record
+        details["folder"] = favorites_folder_key
+        entries.append(details)
 
-@PromptServer.instance.routes.post("/Gallery/favorite/toggle")
-async def toggle_favorite(request):
-    """Toggle favorite status of an image by moving it to/from the favorites folder."""
+    return entries
+
+@PromptServer.instance.routes.post("/Gallery/folder/create")
+async def create_folder(request):
+    """Endpoint to create a new folder."""
     from .gallery_config import gallery_log
     try:
         data = await request.json()
-        image_url = data.get("image_path")
+        folder_path = data.get("folder_path")
+        if not folder_path:
+            return web.Response(status=400, text="folder_path is required")
+
+        static_dir = _get_static_directory()
+        # Normalize the folder key coming from the frontend.
+        # The frontend uses the same "folder key" scheme as /Gallery/list,
+        # where keys are rooted at the basename of static_dir (e.g. "output").
+        raw_key = _normalize_folder_key_value(str(folder_path))
+
+        # Derive the root key from the static directory (matches /Gallery/list behaviour)
+        root_key = os.path.basename(os.path.normpath(static_dir))
+        root_key_normalized = _normalize_folder_key_value(root_key)
+
+        # Use the same helper used elsewhere to resolve folder keys into real paths
+        target_dir = _folder_key_to_path(static_dir, root_key_normalized, raw_key)
+        if not target_dir:
+            return web.Response(status=400, text="Invalid folder path")
+
+        full_path = os.path.normpath(target_dir)
+        static_real = os.path.realpath(static_dir)
+        if not os.path.realpath(full_path).startswith(static_real):
+            return web.Response(status=403, text="Access denied: Folder outside of allowed directory")
+
+        if os.path.exists(full_path):
+            return web.Response(status=409, text="Folder already exists")
+
+        os.makedirs(full_path, exist_ok=True)
+        gallery_log(f"Created folder: {full_path}")
+        return web.Response(text=f"Folder created: {folder_path}")
+    except Exception as e:
+        gallery_log(f"Error creating folder: {e}")
+        import traceback
+        traceback.print_exc()
+        return web.Response(status=500, text=str(e))
+
+
+@PromptServer.instance.routes.post("/Gallery/folder/delete")
+async def delete_folder(request):
+    """Endpoint to delete a folder and all its contents."""
+    from .gallery_config import gallery_log
+    try:
+        data = await request.json()
+        folder_path = data.get("folder_path")
+        if not folder_path:
+            return web.Response(status=400, text="folder_path is required")
+
+        static_dir = _get_static_directory()
+        raw_key = _normalize_folder_key_value(str(folder_path))
+
+        root_key = os.path.basename(os.path.normpath(static_dir))
+        root_key_normalized = _normalize_folder_key_value(root_key)
+
+        target_dir = _folder_key_to_path(static_dir, root_key_normalized, raw_key)
+        if not target_dir:
+            return web.Response(status=400, text="Invalid folder path")
+
+        full_path = os.path.normpath(target_dir)
+        static_real = os.path.realpath(static_dir)
+        if not os.path.realpath(full_path).startswith(static_real):
+            return web.Response(status=403, text="Access denied: Folder outside of allowed directory")
+
+        if not os.path.isdir(full_path):
+            return web.Response(status=404, text="Folder not found")
+
+        # Prevent deleting the root gallery folder itself
+        if os.path.realpath(full_path) == static_real:
+            return web.Response(status=400, text="Cannot delete root gallery folder")
+
+        shutil.rmtree(full_path)
+        gallery_log(f"Deleted folder: {full_path}")
+        return web.Response(text=f"Folder deleted: {folder_path}")
+    except Exception as e:
+        gallery_log(f"Error deleting folder: {e}")
+        import traceback
+        traceback.print_exc()
+        return web.Response(status=500, text=str(e))
+
+
+@PromptServer.instance.routes.post("/Gallery/favorite/toggle")
+async def toggle_favorite(request):
+    """Toggle favorite status of an image without moving files."""
+    from .gallery_config import gallery_log
+    try:
+        data = await request.json()
+        image_url = _normalize_favorite_url(data.get("image_path"))
         if not image_url:
             return web.Response(status=400, text="image_path is required")
 
-        # Resolve the file path
         full_path = _resolve_static_file(image_url)
         if full_path is None:
             return web.Response(status=403, text="Access denied")
@@ -634,53 +795,24 @@ async def toggle_favorite(request):
             return web.Response(status=404, text="File not found")
 
         static_dir = _get_static_directory()
-        favorites_folder = _get_favorites_folder()
-        filename = os.path.basename(full_path)
+        favorites = _load_existing_favorites(static_dir)
 
-        is_favorite = _is_in_favorites(full_path)
-
+        is_favorite = image_url in favorites
         if is_favorite:
-            # Move OUT of favorites - back to root
-            new_path = os.path.join(static_dir, filename)
-            # Handle filename conflicts
-            counter = 1
-            base_name, ext = os.path.splitext(filename)
-            while os.path.exists(new_path):
-                new_path = os.path.join(static_dir, f"{base_name}_{counter}{ext}")
-                counter += 1
-            shutil.move(full_path, new_path)
-            invalidate_cached_metadata(full_path)
-            invalidate_cached_metadata(new_path)
-            # Calculate new URL
-            new_relative = os.path.relpath(new_path, static_dir).replace("\\", "/")
-            new_url = f"/static_gallery/{new_relative}"
-            gallery_log(f"Removed from favorites: {filename}")
-            return web.json_response({
-                "is_favorite": False,
-                "new_path": new_url,
-                "message": f"Removed from favorites: {filename}"
-            })
+            favorites = [url for url in favorites if url != image_url]
+            message = "Removed from favorites"
         else:
-            # Move INTO favorites
-            new_path = os.path.join(favorites_folder, filename)
-            # Handle filename conflicts
-            counter = 1
-            base_name, ext = os.path.splitext(filename)
-            while os.path.exists(new_path):
-                new_path = os.path.join(favorites_folder, f"{base_name}_{counter}{ext}")
-                counter += 1
-            shutil.move(full_path, new_path)
-            invalidate_cached_metadata(full_path)
-            invalidate_cached_metadata(new_path)
-            # Calculate new URL
-            new_relative = os.path.relpath(new_path, static_dir).replace("\\", "/")
-            new_url = f"/static_gallery/{new_relative}"
-            gallery_log(f"Added to favorites: {filename}")
-            return web.json_response({
-                "is_favorite": True,
-                "new_path": new_url,
-                "message": f"Added to favorites: {filename}"
-            })
+            favorites = [url for url in favorites if url != image_url] + [image_url]
+            message = "Added to favorites"
+
+        _save_favorites_list(favorites)
+        gallery_log(f"{message}: {image_url}")
+
+        return web.json_response({
+            "is_favorite": not is_favorite,
+            "favorites": favorites,
+            "message": message,
+        })
     except Exception as e:
         gallery_log(f"Error toggling favorite: {e}")
         import traceback
@@ -690,19 +822,10 @@ async def toggle_favorite(request):
 
 @PromptServer.instance.routes.get("/Gallery/favorites")
 async def get_favorites(request):
-    """Get list of all favorited images."""
+    """Get list of all favorited images (virtual folder)."""
     try:
-        favorites_folder = _get_favorites_folder()
         static_dir = _get_static_directory()
-        favorites = []
-
-        if os.path.exists(favorites_folder):
-            for filename in os.listdir(favorites_folder):
-                file_path = os.path.join(favorites_folder, filename)
-                if os.path.isfile(file_path):
-                    relative = os.path.relpath(file_path, static_dir).replace("\\", "/")
-                    favorites.append(f"/static_gallery/{relative}")
-
+        favorites = _load_existing_favorites(static_dir)
         return web.json_response({"favorites": favorites})
     except Exception as e:
         from .gallery_config import gallery_log
