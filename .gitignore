@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Database files (generated at runtime)
+*.db
+*.db-shm
+*.db-wal
+*.mm
+
+# User settings (generated at runtime)
+user_settings.json
+
+# Node modules (built files are committed)
+web/node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tracking file
+.tracking
+

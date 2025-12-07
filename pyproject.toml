@@ -1,0 +1,14 @@
+[project]
+name = "ComfyUI-Gallery"
+description = "Real-time Gallery for ComfyUI with image metadata inspection. Support for images and video."
+version = "2.6.0"
+license = {file = "LICENSE"} 
+
+[project.urls]
+Repository = "https://github.com/PanicTitan/ComfyUI-Gallery"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = "panic-titan"
+DisplayName = "ComfyUI-Gallery"
+Icon = "https://raw.githubusercontent.com/PanicTitan/ComfyUI-Gallery/refs/heads/main/logo.png"
